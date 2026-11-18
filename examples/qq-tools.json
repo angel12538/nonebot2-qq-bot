@@ -1,0 +1,10 @@
+{
+  "base_url": "http://127.0.0.1:5700",
+  "token": "",
+  "default_group_id": 0,
+  "bound_group_id": 0,
+  "allow_groups": [],
+  "allow_private": false,
+  "stickers_dir": "",
+  "poke_cooldown_sec": 30
+}

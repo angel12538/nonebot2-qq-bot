@@ -1,0 +1,7 @@
+{
+  "name": "default",
+  "model": "your-model-id",
+  "base_url": "https://example.com/v1",
+  "api_key": "",
+  "protocol": "openai"
+}

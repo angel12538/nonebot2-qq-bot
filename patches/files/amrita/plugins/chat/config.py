@@ -1,0 +1,889 @@
+import json
+import os
+import re
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, ClassVar, Literal
+
+import nonebot_plugin_localstore as store
+import tomli
+import tomli_w
+from amrita_core import ModelPreset as ModelPreset
+from amrita_core import set_config
+from amrita_core.config import (
+    AmritaConfig as AmritaCoreConfig,
+)
+from amrita_core.config import (
+    LLMConfig as CoreLLMConfig,
+)
+from nonebot import get_driver, logger
+from nonebot_plugin_uniconf import EnvfulConfigManager, UniConfigManager
+from pydantic import BaseModel, Field, field_validator, model_validator
+from typing_extensions import final, override
+
+from .preset_store import PresetStore
+from .prompt_store import Prompt as Prompt
+from .prompt_store import Prompts, PromptStore
+from .services import ModelConfigService, PresetService, PromptService
+
+__kernel_version__ = "unknown"
+
+
+CONFIG_DIR: Path = store.get_plugin_config_dir()
+driver = get_driver()
+nb_config = driver.config
+
+
+@lru_cache(maxsize=8)
+def _compile_pattern(pattern: str) -> re.Pattern[str]:
+    return re.compile(pattern)
+
+
+class ToolsConfig(BaseModel):
+
+    enable_report: bool = Field(title="启用内容审查", default=True, description="是否启用内容审查系统")
+    report_exclude_system_prompt: bool = Field(title="审查时排除系统提示词",
+        default=False,
+        description="是否排除系统提示词，默认情况下，内容审查会检查系统提示和上下文",
+    )
+    report_exclude_context: bool = Field(title="审查时排除上下文",
+        default=False,
+        description="是否排除上下文，仅检查最后一条消息，默认情况下，内容审查会检查系统提示和上下文",
+    )
+    report_then_block: bool = Field(title="违规后熔断会话",
+        default=True, description="检测到违规内容后是否熔断会话"
+    )
+    report_invoke_level: Literal["low", "medium", "high"] = Field(json_schema_extra={"option_labels": {'low': '宽松（low）', 'medium': '适中（medium）', 'high': '严格（high）'}}, title="审查严格程度",
+        default="medium",
+        description="内容审查的严格程度，可选值：low, medium, high",
+    )
+
+
+class StepLifecycleConfig(BaseModel):
+    """Step 生命周期消息开关（type=step）"""
+
+    decompose: bool = Field(title="分解决策", default=True, description="分解决策（simple/DAG）")
+    intro: bool = Field(title="进入 Step", default=True, description="进入 Step（phase/编号/描述）")
+    leave: bool = Field(title="离开 Step", default=True, description="离开 Step（摘要动词/宾语）")
+    stall: bool = Field(title="停滞检测", default=True, description="停滞检测（重复工具签名）")
+    compress: bool = Field(title="Step 间压缩", default=True, description="Step 间压缩（tokens/阈值）")
+
+
+class MetaInfoConfig(BaseModel):
+    """元信息消息显示开关（Core 通过 io_stream 推送的 MessageWithMetadata）"""
+
+    enable: bool = Field(title="元信息总开关", default=True, description="元信息总开关")
+    step: StepLifecycleConfig = Field(title="Step 生命周期消息",
+        default_factory=StepLifecycleConfig, description="Step 生命周期消息开关"
+    )
+    reflection: bool = Field(title="反思结果", default=True, description="反思结果（pass/warning/fail）")
+    error_report: bool = Field(title="错误报告",
+        default=True, description="错误报告：loop_reasoning / Agent 运行失败"
+    )
+    stream_reasoning: bool = Field(title="流式思考块",
+        default=False, description="流式思考块（单token粒度，默认关闭避免刷屏）"
+    )
+    reasoning: bool = Field(title="整段思考块",
+        default=True, description="整段思考块（reasoning / structured_reasoning_step）"
+    )
+    tool_call: bool = Field(title="工具调用通知",
+        default=False, description="工具调用通知（工具预测与调用结果）"
+    )
+    skill_trigger: bool = Field(title="技能触发通知",
+        default=True, description="技能触发通知（使用了xxx技能）"
+    )
+
+
+class SkillConfig(BaseModel):
+    """技能系统配置（faskill Skills）"""
+
+    enable: bool = Field(title="启用技能系统", default=True, description="是否启用技能系统")
+    mode: Literal["progressive", "invoke"] = Field(json_schema_extra={"option_labels": {'progressive': '渐进式：统一两个工具（progressive）', 'invoke': '每个技能一个工具（invoke）'}}, title="技能注册模式",
+        default="progressive",
+        description=(
+            "技能工具注册模式：progressive=统一注册 skill_open/skill_read 两个工具；"
+            "invoke=每个技能注册一个工具（兼容旧行为）"
+        ),
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _legacy_mode(cls, data: Any) -> Any:
+        """旧配置文件没有 mode 字段时按 invoke 处理，保持原有工具形态。"""
+        if isinstance(data, dict) and data and "mode" not in data:
+            return {**data, "mode": "invoke"}
+        return data
+
+    selected: list[str] = Field(title="启用的技能",
+        default=[],
+        description=("启用的技能名称列表（空列表=全部启用；非空则仅列表内的技能启用）"),
+    )
+    echo_skill_directory: bool = Field(title="回显技能目录",
+        default=True,
+        description=(
+            "是否在技能返回内容中回显技能目录（远程沙箱场景可关闭，避免暴露本地路径）"
+        ),
+    )
+    allow_script_execution: bool = Field(title="允许执行技能脚本",
+        default=True,
+        description=(
+            "是否允许执行技能脚本（关闭后不再注入脚本工具，技能只返回正文；"
+            "与 echo_skill_directory 相互独立）"
+        ),
+    )
+
+
+class SessionConfig(BaseModel):
+    session_control: bool = Field(title="会话超时自动清理", default=False, description="是否启用会话超时自动清理")
+    session_allow_continue: bool = Field(title="允许会话继续", default=True, description="是否允许会话继续")
+    session_control_time: int = Field(title="会话超时（分钟）",
+        default=60, description="会话超时时间（单位：分钟）"
+    )
+    session_control_history: int = Field(title="会话历史保存条数",
+        default=10, description="会话历史记录最大保存条数"
+    )
+    session_long_running_notify_seconds: int = Field(title="私聊长任务提示（秒）",
+        default=180,
+        description="私聊Agent超时提示阈值（单位：秒），超过此时间未返回则提示用户可终止任务。设为0禁用",
+    )
+
+
+class AutoReplyConfig(BaseModel):
+    enable: bool = Field(title="启用自动回复", default=False, description="是否启用自动回复系统")
+    global_enable: bool = Field(title="全局启用",
+        default=False, description="是否全局启用自动回复（无视会话状态）"
+    )
+    probability: float = Field(title="随机触发概率", default=1e-2, description="随机触发概率（0.01=1%）")
+    keywords: list[str] = Field(title="触发关键词", default=["at"], description="触发自动回复的关键字列表")
+    keywords_mode: Literal["starts_with", "contains"] = Field(json_schema_extra={"option_labels": {'starts_with': '以关键词开头（starts_with）', 'contains': '包含关键词（contains）'}}, title="关键词匹配方式",
+        default="starts_with", description="自动回复配置(starts_with/contains)"
+    )
+
+
+class FunctionConfig(BaseModel):
+    message_type: Literal["xml", "legacy"] = Field(json_schema_extra={"option_labels": {'xml': '中文标签：清晰但费 Token（xml）', 'legacy': '紧凑格式（legacy）'}}, title="消息格式",
+        default="legacy",
+        description=(
+            "消息格式类型：\n"
+            '  xml    — 【消息 role="群主" name="张三" uid="12345" time="2026-09-19 Saturday 15:24:37"】\n{内容}\n【消息结束】（结构清晰但费tokens）\n'
+            "  legacy — [群主][2026-09-19 Saturday 15:24:37][张三（12345）]说:内容（紧凑但LLM易误解析）"
+        ),
+    )
+    chat_pending_mode: Literal[
+        "single", "queue", "single_with_report", "interactive"
+    ] = Field(json_schema_extra={"option_labels": {'single': '忽略新消息（single）', 'queue': '排队等上一条处理完（queue）', 'single_with_report': '忽略并提示在处理中（single_with_report）', 'interactive': '推给正在运行的对话（interactive）'}}, title="并发消息处理方式",
+        default="queue",
+        description="聊天时，如果同一个Session并发调用但是上一条消息没有处理完时插件的行为。\n"
+        + "single: 忽略这条消息；\n"
+        + "queue: 等待上一条消息处理完再处理；\n"
+        + "single_with_report: 忽略这条消息并提示用户正在等待。；\n"
+        + "interactive: 将消息通过反向流推送给正在运行的ChatObject（Step边界消费）",
+    )
+    chat_debounce_window: float = Field(title="防抖窗口（秒）",
+        default=0.0,
+        description="消息防抖窗口（秒）：窗口内同一会话同一用户的多条消息（含随后补的图片）会合并为一次请求的用户输入；<=0 时关闭。",
+    )
+    chat_debounce_max_messages: int = Field(title="防抖单批最大条数",
+        default=20, description="消息防抖单批最大条数，超过即收口；<=0 表示不限制。"
+    )
+    chat_debounce_max_wait: float = Field(title="防抖单批最长等待（秒）",
+        default=5.0,
+        description="消息防抖单批最长存活时长（秒），超过即收口；<=0 表示不限制。",
+    )
+    synthesize_forward_message: bool = Field(title="解析合并转发",
+        default=True, description="是否解析合并转发消息"
+    )
+    nature_chat_style: bool = Field(title="自然分句",
+        default=True, description="是否启用自然对话风格优化(自动分句)"
+    )
+    nature_chat_cut_pattern: str = Field(title="分句正则",
+        default=r'([。！？!?;；\n]+)[""\'\'"\s]*', description="分句功能的正则表达式"
+    )
+    poke_reply: bool = Field(title="响应戳一戳", default=True, description="是否响应戳一戳事件")
+    enable_group_chat: bool = Field(title="启用群聊", default=True, description="是否启用群聊功能")
+    enable_private_chat: bool = Field(title="启用私聊", default=True, description="是否启用私聊功能")
+    allow_custom_prompt: bool = Field(title="允许自定义提示词",
+        default=True, description="是否允许用户自定义提示词"
+    )
+    use_user_nickname: bool = Field(title="用 QQ 昵称代替群名片",
+        default=False, description="在群聊中使用QQ昵称而非群名片"
+    )
+    forward_threshold: int = Field(title="长回复转合并转发（字数）",
+        default=200,
+        description="最终响应超过该字符数时改用合并转发发送（0=禁用）",
+    )
+    forward_min_chunk: int = Field(title="合并转发分块最小字数",
+        default=500,
+        description="合并转发时每个分块的最小字符数，不满足则不分块",
+    )
+
+    @property
+    def pattern(self) -> re.Pattern:
+        """
+        获取分句的正则表达式
+        """
+        return _compile_pattern(self.nature_chat_cut_pattern)
+
+
+class PresetSwitch(BaseModel):
+    backup_preset_list: list[str] = Field(title="备选模型预设",
+        default=[], description="主模型不可用时自动切换的备选模型预设列表"
+    )
+
+
+
+class ExtendConfig(BaseModel):
+    say_after_self_msg_be_deleted: bool = Field(title="被撤回后自动回复",
+        default=False, description="消息被撤回后是否自动回复"
+    )
+    group_added_msg: str = Field(title="入群欢迎消息",
+        default="你好，我是Amria，有关使用手册见https://bot.amritabot.com",
+        description="入群欢迎消息",
+    )
+    send_msg_after_be_invited: bool = Field(title="被邀请入群后发言",
+        default=False, description="被邀请入群后是否主动发言"
+    )
+    after_deleted_say_what: list[str] = Field(title="被撤回后的随机回复",
+        default=[
+            "抱歉啦，不小心说错啦～",
+            "嘿，发生什么事啦？我",
+            "唔，我是不是说错了什么？",
+            "纠错时间到，如果我说错了请告诉我！",
+            "发生了什么？我刚刚没听清楚呢~",
+            "我会记住的，绝对不再说错话啦~",
+            "哦，看来我又犯错了，真是不好意思！",
+            "哈哈，看来我得多读书了~",
+            "哎呀，真是个小口误，别在意哦~",
+            "哎呀，我也有尴尬的时候呢~",
+            "希望我能继续为你提供帮助，不要太在意我的小错误哦！",
+        ],
+        description="消息被撤回后的随机回复列表",
+    )
+
+
+class UsageLimitConfig(BaseModel):
+    enable_usage_limit: bool = Field(title="启用使用限额", default=False, description="是否启用使用频率限制")
+    group_daily_limit: int = Field(title="每群每日次数", default=100, description="单个群组每日最大使用次数")
+    user_daily_limit: int = Field(title="每人每日次数", default=100, description="单个用户每日最大使用次数")
+    group_daily_token_limit: int = Field(title="每群每日 Token",
+        default=200000, description="单个群组每日最大token消耗量"
+    )
+    user_daily_token_limit: int = Field(title="每人每日 Token",
+        default=100000, description="单个用户每日最大token消耗量"
+    )
+    total_daily_limit: int = Field(title="每日总次数", default=1500, description="总使用次数限制")
+    total_daily_token_limit: int = Field(title="每日总 Token", default=1000000, description="总使用token限制")
+    limit_msg: list[str] = Field(title="达到限额时的回复",
+        default=["今日额度已达上限，请明天再试。"],
+        description="达到使用限制时返回的消息",
+    )
+
+
+
+_MAX_TTL_HOURS = 87600
+
+_HARD_MAX_IMAGE_KB = 32 * 1024
+
+HARD_MAX_IMAGE_BYTES = _HARD_MAX_IMAGE_KB * 1024
+
+_MAX_PRUNE_INTERVAL_MINUTES = 1440
+
+_MAX_READ_CONTEXT_LIMIT = 1000
+
+_HARD_MAX_IMAGE_SIDE = 8192
+
+_MAX_IMAGES_PER_MESSAGE = 64
+_MAX_IMAGES_PER_REQUEST = 64
+
+
+class ContextStoreConfig(BaseModel):
+    """群聊上下文静默存储与多模态本地存储配置
+
+    未被触发的群消息不再写入 LLM 记忆，而是静默落库，由 ``read_context`` 工具按需读取；
+    多模态内容二进制本地落库，上下文中只保留占位符，读取时再还原为 base64。
+    """
+
+    enable: bool = Field(title="启用上下文存储",
+        default=True,
+        description="是否启用群聊上下文静默存储（关闭后未触发的群消息不再记录，read_context 工具一并禁用）",
+    )
+    max_records: int = Field(title="每个会话保留条数",
+        default=200,
+        ge=0,
+        description="每个会话保留的上下文记录条数上限（0=不限制）",
+    )
+    record_ttl_hours: int = Field(title="记录保留时长（小时）",
+        default=72,
+        ge=0,
+        le=_MAX_TTL_HOURS,
+        description="上下文记录淘汰时间（小时），0=不按时间淘汰",
+    )
+    read_context_limit: int = Field(title="read_context 默认条数",
+        default=30,
+        ge=1,
+        le=_MAX_READ_CONTEXT_LIMIT,
+        description=(
+            "read_context 工具单次返回的默认条数，同时也是模型可请求的条数上限"
+            f"（1~{_MAX_READ_CONTEXT_LIMIT}）"
+        ),
+    )
+    read_context_max_images: int = Field(title="read_context 最多还原图片",
+        default=4,
+        ge=0,
+        le=_MAX_IMAGES_PER_MESSAGE,
+        description=(
+            "read_context 单次调用最多还原的图片张数（0=不还原图片，只返回文本），"
+            "避免历史图片一次性撑满上下文"
+        ),
+    )
+    read_context_images: bool = Field(title="read_context 还原图片",
+        default=False,
+        description=(
+            "read_context 是否还原图片：独立开关，与单次请求的图片上限互不影响；"
+            "关闭时只返回文本，不再把历史图片塞进工具结果"
+        ),
+    )
+    max_image_kb: int = Field(title="图片下载上限（KB）",
+        default=10240,
+        ge=0,
+        le=_HARD_MAX_IMAGE_KB,
+        description=(
+            "下载闸：允许拉取的单张图片原始体积（KB），超出则直接丢弃、不再做归一化。"
+            "只约束网络/本地读取，不决定最终存入上下文的大小，因此可以放宽，"
+            f"让手机原图有机会被缩放后再用；0=不限制（内部兜底 {_HARD_MAX_IMAGE_KB}KB）"
+        ),
+    )
+    max_allowed_size: int = Field(title="图片存入上限（KB）",
+        default=2048,
+        ge=0,
+        le=_HARD_MAX_IMAGE_KB,
+        description=(
+            "上下文闸：归一化（缩放 / 转码 / 降质）后允许存入上下文的单张图片体积（KB）。"
+            "仍超出时继续降质、降尺寸压缩直至达标，0=不限制"
+        ),
+    )
+    max_image_width: int = Field(title="图片最大宽度（像素）",
+        default=2048,
+        ge=0,
+        le=_HARD_MAX_IMAGE_SIDE,
+        description=(
+            "允许的单张图片最大宽度（像素），超出则等比缩小（不会放大），"
+            f"0=不限制（内部兜底 {_HARD_MAX_IMAGE_SIDE}）"
+        ),
+    )
+    max_image_height: int = Field(title="图片最大高度（像素）",
+        default=2048,
+        ge=0,
+        le=_HARD_MAX_IMAGE_SIDE,
+        description=(
+            "允许的单张图片最大高度（像素），超出则等比缩小（不会放大），"
+            f"0=不限制（内部兜底 {_HARD_MAX_IMAGE_SIDE}）"
+        ),
+    )
+    max_images_per_message: int = Field(title="单条消息最多图片",
+        default=4,
+        ge=0,
+        le=_MAX_IMAGES_PER_MESSAGE,
+        description=(
+            "单条消息最多采集的图片数量，超出的图片不再下载、直接忽略，"
+            f"0=不限制（内部兜底 {_MAX_IMAGES_PER_MESSAGE}）"
+        ),
+    )
+    max_images_per_request: int = Field(title="单次请求最多图片",
+        default=8,
+        ge=0,
+        le=_MAX_IMAGES_PER_REQUEST,
+        description=(
+            "单次请求最多发送给模型的图片数量（含本轮新图与历史图片，本轮优先），"
+            "超出部分降级为文字提示，0=不限制（内部兜底 "
+            f"{_MAX_IMAGES_PER_REQUEST}）"
+        ),
+    )
+    media_ttl_hours: int = Field(title="图片保留时长（小时）",
+        default=24,
+        ge=0,
+        le=_MAX_TTL_HOURS,
+        description="多模态二进制内容淘汰时间（小时），0=不按时间淘汰",
+    )
+    prune_interval_minutes: int = Field(title="清理间隔（分钟）",
+        default=10,
+        ge=0,
+        le=_MAX_PRUNE_INTERVAL_MINUTES,
+        description=(
+            "后台淘汰任务的节流间隔（分钟）：新增记录/图片时最多每该间隔执行一次淘汰，"
+            "0=不节流（每次新增都执行）"
+        ),
+    )
+    local_media_dirs: list[str] = Field(title="允许读取的本地图片目录",
+        default=[],
+        description=(
+            "允许读取本地图片的目录白名单（绝对路径），空列表=禁止读取任何本地文件。"
+            "消息段中的 file/url 字段完全由客户端控制，放开该白名单等于开放任意文件读取，"
+            "仅在确有本地图片目录时才填写。"
+        ),
+    )
+
+    @field_validator("local_media_dirs")
+    @classmethod
+    def _check_local_media_dirs(cls, value: list[str]) -> list[str]:
+        """目录白名单必须是绝对路径，否则运行期会被静默忽略。"""
+        for raw in value:
+            if not raw:
+                raise ValueError("local_media_dirs 中不允许出现空路径")
+            if not Path(raw).expanduser().is_absolute():
+                raise ValueError(
+                    f"local_media_dirs 必须是绝对路径（或 ~ 开头）: {raw!r}"
+                )
+        return value
+
+
+class LLM_Config(BaseModel):
+
+    tools: ToolsConfig = Field(title="内容审查", default=ToolsConfig(), description="工具调用子系统")
+    block_msg: list[str] = Field(title="熔断提示消息",
+        default=["你好，这个问题我暂时无法处理，请稍后再试。"],
+        description="触发安全熔断时随机返回的提示消息",
+    )
+    agent_strategy: Literal["react", "hybrid-react", "no-action"] = Field(json_schema_extra={"option_labels": {'react': 'ReAct（react）', 'hybrid-react': '混合 ReAct，已废弃（hybrid-react）', 'no-action': '跳过 Agent（no-action）'}}, title="代理策略",
+        default="react",
+        description=(
+            "代理策略：react(仅使用ReAct) / hybrid-react(已废弃，归并到 react) / "
+            "no-action(跳过Agent运行)"
+        ),
+    )
+    agent_workflow: Literal["react", "step-react"] = Field(json_schema_extra={"option_labels": {'react': '普通 ReAct 循环（react）', 'step-react': '按 Step 分步执行（step-react）'}}, title="推理工作流",
+        default="react",
+        description=(
+            "推理工作流：react(普通ReAct循环，一轮工具调用内完成推理与执行) / "
+            "step-react(Step驱动的ReAct循环：LLM先分解计划，框架逐Step走完，"
+            "支持计划修订update_step、停滞检测、Step间压缩，需模型支持结构化输出)"
+        ),
+    )
+
+
+class Config(BaseModel):
+
+    core: AmritaCoreConfig = Field(title="核心设置",
+        default_factory=AmritaCoreConfig,
+        description="Amrita Core 原生配置（与 chat 插件共享）。写入时自动同步到 Core 全局单例。",
+    )
+
+
+    preset_extension: PresetSwitch = Field(title="模型预设扩展",
+        default=PresetSwitch(), description="预设模型扩展配置"
+    )
+    session: SessionConfig = Field(title="会话管理", default=SessionConfig(), description="会话管理配置")
+    skills: SkillConfig = Field(title="技能系统", default=SkillConfig(), description="技能系统配置")
+    meta: MetaInfoConfig = Field(title="元信息消息",
+        default=MetaInfoConfig(), description="元信息消息显示开关"
+    )
+    autoreply: AutoReplyConfig = Field(title="自动回复",
+        default=AutoReplyConfig(), description="自动回复设置"
+    )
+    function: FunctionConfig = Field(title="功能开关",
+        default=FunctionConfig(), description="功能开关配置"
+    )
+    extended: ExtendConfig = Field(title="扩展行为", default=ExtendConfig(), description="扩展行为设置")
+    llm: LLM_Config = Field(title="LLM 功能", default=LLM_Config(), description="LLM核心功能配置")
+    context: ContextStoreConfig = Field(title="群聊上下文存储",
+        default=ContextStoreConfig(),
+        description="群聊上下文静默存储与多模态本地存储配置",
+    )
+    extra: dict[str, Any] = Field(title="扩展预留区", default={}, description="扩展预留区")
+    usage_limit: UsageLimitConfig = Field(title="使用限额",
+        default=UsageLimitConfig(), description="使用限额配置"
+    )
+    enable: bool = Field(title="启用聊天功能", default=False, description="是否启用 Amrita的聊天能力")
+    parse_segments: bool = Field(title="解析特殊消息段",
+        default=True, description="是否解析特殊消息段（如@提及/合并转发等）"
+    )
+    preset: str = Field(title="默认模型预设", default="default", description="默认使用的模型预设配置名称")
+    group_prompt_character: str = Field(title="群聊提示词模板",
+        default="default", description="群聊场景使用的提示词模板名称"
+    )
+    private_prompt_character: str = Field(title="私聊提示词模板",
+        default="default", description="私聊场景使用的提示词模板名称"
+    )
+
+    @staticmethod
+    def _migrate_hide_switches(data: dict[str, Any], source: Any) -> None:
+        """把 AmritaCore 1.0 已移除的 hide 开关搬到本插件的 meta 开关。
+
+        ``agent_tool_call_notice`` / ``agent_reasoning_hide`` 已不在 1.0 的
+        ``BuiltinAgentConfig`` 中，残留值会被 pydantic 静默忽略；这里翻译成
+        ``meta.tool_call`` / ``meta.reasoning``，避免用户设置无声失效。
+        """
+        if not isinstance(source, dict):
+            return
+        notice = source.pop("agent_tool_call_notice", None)
+        hide_reasoning = source.pop("agent_reasoning_hide", None)
+        if notice is None and hide_reasoning is None:
+            return
+        meta = data.setdefault("meta", {})
+        if not isinstance(meta, dict):
+            return
+        if notice is not None:
+            meta.setdefault("tool_call", notice == "notify")
+        if hide_reasoning is not None:
+            meta.setdefault("reasoning", not hide_reasoning)
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_old_config(cls, data: Any) -> Any:
+        """
+        迁移旧版 flat 配置到 core 嵌入结构。
+
+        旧 TOML 格式 (无 core 键):
+            { "llm": { "memory_length_limit": ..., ... },
+              "cookies": { "cookie": ..., "enable_cookie": ... },
+              "llm.tools": { "tool_calling_mode": ..., ... } }
+
+        新 TOML 格式 (有 core 键则跳过):
+            { "core": { "llm": {...}, "cookie": {...}, "builtin": {...}, "function_config": {...} },
+              "llm": { "block_msg": ..., "agent_strategy": ..., "tools": {<chat-only>} },
+              ... }
+        """
+        if not isinstance(data, dict):
+            return data
+
+
+        if isinstance(data.get("default_preset"), dict):
+            try:
+                default_json = CONFIG_DIR / "models" / "default.json"
+                if not default_json.exists():
+                    default_json.parent.mkdir(parents=True, exist_ok=True)
+                    ModelPreset.model_validate(data["default_preset"]).save(
+                        default_json
+                    )
+            except Exception as e:
+                logger.warning(f"迁移内嵌 default_preset 失败: {e!s}")
+            data.pop("default_preset")
+
+        if "core" in data:
+
+            core = data.get("core")
+            cls._migrate_hide_switches(
+                data, core.get("builtin") if isinstance(core, dict) else None
+            )
+            return data
+
+        core_data: dict[str, Any] = {}
+
+
+        if "cookies" in data:
+            cookies = data.pop("cookies")
+            if isinstance(cookies, dict):
+                core_data["cookie"] = {
+                    k: v
+                    for k, v in {
+                        "enable_cookie": cookies.get("enable_cookie", False),
+                        "cookie": cookies.get("cookie", ""),
+                    }.items()
+                    if v is not None
+                }
+
+
+        if "llm" in data and isinstance(data["llm"], dict):
+            llm = data["llm"]
+            core_llm: dict[str, Any] = {}
+            for field_name in CoreLLMConfig.model_fields:
+                if field_name in llm:
+                    val = llm.pop(field_name)
+                    if val is not None:
+                        core_llm[field_name] = val
+            if core_llm:
+                core_data["llm"] = core_llm
+
+
+            if "tools" in llm and isinstance(llm["tools"], dict):
+                tools = llm["tools"]
+
+
+                cls._migrate_hide_switches(data, tools)
+
+                core_data["builtin"] = {
+                    "tool_calling_mode": tools.pop("tool_calling_mode", "agent"),
+                    "agent_thought_mode": tools.pop("agent_thought_mode", "chat"),
+                }
+
+                func_cfg = {
+                    "use_minimal_context": tools.pop("use_minimal_context", True),
+                    "agent_tool_call_limit": tools.pop("agent_tool_call_limit", 10),
+                    "agent_middle_message": tools.pop("agent_middle_message", True),
+                    "agent_mcp_client_enable": tools.pop(
+                        "agent_mcp_client_enable", False
+                    ),
+                    "agent_mcp_server_scripts": tools.pop(
+                        "agent_mcp_server_scripts", []
+                    ),
+                }
+                core_data["function_config"] = {
+                    k: v for k, v in func_cfg.items() if v is not None
+                }
+
+        if core_data:
+            data["core"] = core_data
+        return data
+
+    @classmethod
+    def load_from_toml(cls, path: Path) -> "Config":
+        """从 TOML 文件加载配置"""
+        if not path.exists():
+            return cls()
+        with open(str(path), encoding="u8") as f:
+            data: dict[str, Any] = tomli.loads(f.read())
+        return cls.model_validate(data)
+
+    def validate_value(self):
+        """校验配置"""
+        if self.core.llm.max_tokens <= 0:
+            raise ValueError("max_tokens必须大于零!")
+        if self.core.llm.llm_timeout <= 0:
+            raise ValueError("LLM请求超时时间必须大于零！")
+        if self.core.llm.session_tokens_windows <= 0:
+            raise ValueError("上下文最大Tokens限制必须大于零！")
+        if self.session.session_control:
+            if self.session.session_control_history <= 0:
+                raise ValueError("会话历史最大值不能为0！")
+            if self.session.session_control_time <= 0:
+                raise ValueError("会话生命周期时间不能小于零！")
+
+    @classmethod
+    def load_from_json(cls, path: Path) -> "Config":
+        """从 JSON 文件加载配置"""
+        with path.open("r", encoding="utf-8") as f:
+            data: dict[str, Any] = json.load(f)
+        return cls.model_validate(data)
+
+    def save_to_toml(self, path: Path):
+        """保存配置到 TOML 文件"""
+        with path.open("w", encoding="utf-8") as f:
+            f.write(tomli_w.dumps(self.model_dump(exclude_none=True)))
+
+    def model_dump(self, **kwargs: Any) -> dict[str, Any]:
+        """覆盖 model_dump，默认排除 None 值以兼容 TOML 序列化。"""
+        kwargs.setdefault("exclude_none", True)
+        return super().model_dump(**kwargs)
+
+
+@final
+class ConfigManager(EnvfulConfigManager[Config]):
+    config_dir: Path = CONFIG_DIR
+    private_prompts: Path = config_dir / "private_prompts"
+    group_prompts: Path = config_dir / "group_prompts"
+    custom_models_dir: Path = config_dir / "models"
+    prompt_store: ClassVar[PromptStore] = PromptStore(private_prompts, group_prompts)
+    preset_store: ClassVar[PresetStore] = PresetStore(custom_models_dir)
+    config: Config
+    _owner_name: str = "chat"
+    __lateinit__ = True
+
+    def __init__(self) -> None:
+
+        self.presets = PresetService(
+            self.preset_store,
+            get_ins_config=lambda: self.ins_config,
+            save_config=lambda: self.save_config(),
+        )
+        self.prompts = PromptService(
+            self.prompt_store,
+            get_ins_config=lambda: self.ins_config,
+        )
+        self.models = ModelConfigService(
+            self.preset_store,
+        )
+
+    @override
+    def _update_cache(self, value: Config | None = None):
+        super()._update_cache(value)
+        set_config(self.config.core)
+
+    async def __apost_init__(self):
+        await self.load()
+
+    async def load(self):
+        """_初始化配置目录_"""
+
+        async def prompt_callback():
+            logger.info("正在重载插件提示词文件...")
+            await self.get_prompts(False, True)
+            self.load_prompt()
+            logger.success("提示词文件已重载")
+
+        async def models_callback():
+            logger.info("正在重载模型目录...")
+            await self.get_all_presets(False)
+            logger.success("完成")
+
+        async def skills_callback():
+
+            from .skills import reload_skills
+
+            logger.info("正在重载技能目录...")
+            results = await reload_skills()
+            failed = [r.name for r in results if not r.ok]
+            if failed:
+                logger.warning(
+                    "技能目录变化，重新加载后 %d 个技能校验失败: %s",
+                    len(failed),
+                    failed,
+                )
+            else:
+                logger.success(f"技能目录已重载: {len(results)} 个技能")
+
+        logger.info("正在初始化存储目录...")
+        logger.debug(f"配置目录: {self.config_dir}")
+        os.makedirs(self.config_dir, exist_ok=True)
+        os.makedirs(self.private_prompts, exist_ok=True)
+        os.makedirs(self.group_prompts, exist_ok=True)
+        os.makedirs(self.custom_models_dir, exist_ok=True)
+
+        await UniConfigManager().add_directory(
+            "models",
+            lambda *_: models_callback(),
+            owner_name="chat",
+        )
+
+        await UniConfigManager().add_directory(
+            "skills",
+            lambda *_: skills_callback(),
+            lambda change: change[1].startswith(str(self.config_dir / "skills")),
+            owner_name="chat",
+        )
+        self.validate_presets()
+        ps = await self.get_all_presets(cache=False)
+        logger.info(f"加载了{len(ps)}个模型 (包含默认)")
+        p = await self.get_prompts(cache=False)
+        logger.info(f"加载了{len(p.group) + len(p.private)}个提示词")
+        self.load_prompt()
+        await UniConfigManager().add_directory(
+            "group_prompts",
+            lambda *_: prompt_callback(),
+            lambda change: (
+                (change[1].startswith(str(self.group_prompts)))
+                and change[1].endswith(".txt")
+            ),
+            owner_name="chat",
+        )
+        await UniConfigManager().add_directory(
+            "private_prompts",
+            lambda *_: prompt_callback(),
+            lambda change: (
+                change[1].startswith(str(self.private_prompts))
+                and change[1].endswith(".txt")
+            ),
+            owner_name="chat",
+        )
+
+    async def get_prompts(
+        self, cache: bool = False, load_only: bool = False
+    ) -> Prompts:
+        """获取提示词（委托 PromptService）"""
+        return await self.prompts.get_prompts(cache=cache, load_only=load_only)
+
+    def load_prompt(self):
+        """加载提示词，匹配预设（委托 PromptService，纯内存操作）"""
+        self.prompts.load_prompt()
+
+    @property
+    def private_train(self) -> dict[str, str]:
+        """获取私聊提示词（委托 PromptService）"""
+        return self.prompts.private_train
+
+    @property
+    def group_train(self) -> dict[str, str]:
+        """获取群聊提示词（委托 PromptService）"""
+        return self.prompts.group_train
+
+    def validate_presets(self):
+        """校验所有预设文件（委托 PresetService）"""
+        self.presets.validate()
+
+    async def get_all_presets(self, cache: bool = True) -> list[ModelPreset]:
+        """获取模型列表（委托 PresetService，默认走缓存）"""
+        return await self.presets.get_all_presets(cache=cache)
+
+    async def get_preset(
+        self, preset: str, fix: bool = False, cache: bool = True
+    ) -> ModelPreset | None:
+        """获取预设配置（委托 PresetService，默认走缓存）
+
+        Args:
+            preset (str): _预设的字符串名称_
+            fix (bool, optional): _找不到时是否回退并持久化_. Defaults to False.
+            cache (bool, optional): _是否使用缓存_. Defaults to True.
+
+        Returns:
+            ModelPreset | None: _模型预设对象；找不到且未 fix 时为 None_
+        """
+        return await self.presets.get_preset(preset, fix=fix, cache=cache)
+
+    def get_preset_path(self, name: str) -> Path:
+        """预设名对应的文件路径（委托 PresetService）"""
+        return self.presets.get_preset_path(name)
+
+    def forget_preset(self, name: str) -> None:
+        """移除预设名到路径的记录（委托 PresetService）"""
+        self.presets.forget_preset(name)
+
+    async def save_config(self):
+        """保存配置"""
+        await UniConfigManager().save_config(self._owner_name)
+        self.sync_core_runtime()
+
+    def sync_core_runtime(self) -> None:
+        """把 ``ins_config`` 的 core 子树推回 Core 全局单例。
+
+        直接改 ``ins_config`` 不会刷新 ``config``（那是替换过环境变量的副本），
+        也不会让 Core 的 ``get_config()`` 看到变化，运行时用的仍是旧对象。
+        改完 core 相关的字段后必须调一次。
+        """
+        self._update_cache()
+
+    async def set_config(self, key: str, value: str):
+        """
+        设置配置
+
+        :param key: 配置项的名称
+        :param value: 配置项的值
+
+        :raises KeyError: 如果配置项不存在，则抛出异常
+        """
+        if hasattr(self.ins_config, key):
+            setattr(self.ins_config, key, value)
+            await self.save_config()
+        else:
+            raise KeyError(f"配置项 {key} 不存在")
+
+    async def register_config(self, key: str, default_value=None):
+        """
+        注册配置项
+
+        :param key: 配置项的名称
+
+        """
+        if default_value is None:
+            default_value = "null"
+        self.ins_config.extra.setdefault(key, default_value)
+        await self.save_config()
+
+    async def reg_config(self, key: str, default_value=None):
+        """
+        注册配置项
+
+        :param key: 配置项的名称
+
+        """
+        return await self.register_config(key, default_value)
+
+    def reg_model_config(self, key: str, default_value=None):
+        """
+        注册模型配置项（委托 ModelConfigService）
+
+        :param key: 配置项的名称
+
+        """
+        self.models.reg_model_config(key, default_value)
+
+
+config_manager = ConfigManager()

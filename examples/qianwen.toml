@@ -1,0 +1,15 @@
+[whitelist]
+groups = []
+private = []
+
+[admin]
+superusers = []
+
+[rhythm]
+proactive_enable = false
+
+[memory_auto]
+enabled = false
+
+[trace]
+enabled = false

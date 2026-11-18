@@ -1,0 +1,627 @@
+"""WebSocket 实时数据推送。
+
+设计：
+- 端点：/amrita/ui/ws（需登录，cookie 认证）
+- 协议：客户端发送 JSON 命令，服务端按频道推送
+  - 订阅：{"action":"subscribe","channels":["system","logs"]}
+  - 退订：{"action":"unsubscribe","channels":["system"]}
+  - 心跳：{"action":"ping"}
+- 频道：
+  - system: 系统资源（CPU/内存/磁盘/网络），按 WsConfig.system_interval 间隔推送，订阅即推快照
+  - bot:    Bot 连接状态（变化时广播 + 订阅即推快照）
+  - logs:   实时日志（劫持 loguru sink；仅本次 Bot 启动以来的日志，不混入 event.json 历史；订阅时按 tail 语义回放最新 N 条，N 由 WsConfig.log_replay_limit / 前端 opts 控制）
+
+第三方插件可用 :func:`amrita.plugins.webui.API.register_ws_channel` 声明自己的频道，
+并用 :func:`amrita.plugins.webui.API.broadcast_ws` 推送数据；未声明的频道会被忽略。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import json
+import logging
+import os
+import threading
+import weakref
+from collections import deque
+from collections.abc import Awaitable, Callable, Coroutine
+from datetime import datetime
+from pathlib import Path
+from typing import Any, TextIO
+from urllib.parse import urlsplit
+
+import aiofiles
+import nonebot
+from fastapi import WebSocket, WebSocketDisconnect
+from fastapi.websockets import WebSocketState
+from pytz import utc
+
+from amrita.config import get_amrita_config
+from amrita.utils.system_health import calculate_system_usage
+
+from .authlib import TOKEN_KEY, TokenManager
+from .config import WsConfig, data_manager, register_ws_config_reload_hook
+from .main import app
+
+logger = logging.getLogger(__name__)
+
+
+
+_LEVEL_META: dict[str, tuple[str, str]] = {
+    "WARNING": ("yellow", "exclamation-triangle"),
+    "ERROR": ("red", "bug"),
+    "CRITICAL": ("darkred", "skull"),
+    "FATAL": ("purple", "times"),
+    "INFO": ("green", "info"),
+    "DEBUG": ("blue", "code"),
+    "TRACE": ("gray", "code"),
+    "SUCCESS": ("teal", "check"),
+}
+
+
+SnapshotProvider = Callable[
+    [], "Awaitable[dict[str, Any] | None] | dict[str, Any] | None"
+]
+"""频道快照提供者：订阅瞬间调用一次，可为同步或异步，返回 ``None`` 表示无快照。"""
+
+
+class ChannelHub:
+    def __init__(self) -> None:
+        self._subscribers: dict[str, set[WebSocket]] = {}
+
+        self._locks: dict[WebSocket, asyncio.Lock] = {}
+
+        self._channels: dict[str, SnapshotProvider | None] = {}
+
+    def register_channel(
+        self, name: str, snapshot: SnapshotProvider | None = None
+    ) -> None:
+        """声明一个可订阅频道（重复声明覆盖旧的快照提供者）。"""
+        self._channels[name] = snapshot
+
+    def has_channel(self, name: str) -> bool:
+        return name in self._channels
+
+    def channels(self) -> frozenset[str]:
+        return frozenset(self._channels)
+
+    async def snapshot(self, channel: str) -> dict[str, Any] | None:
+        """取频道的订阅快照；未声明或无快照时返回 ``None``。"""
+        provider = self._channels.get(channel)
+        if provider is None:
+            return None
+        result = provider()
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    async def broadcast(self, channel: str, data: dict[str, Any]) -> None:
+        """向频道所有订阅者推送；失败的订阅者静默剔除，不阻塞广播循环。"""
+        message = {"channel": channel, "data": data}
+        dead = [
+            ws
+            for ws in self.subscribers(channel)
+            if not await _send_to_subscriber(ws, message)
+        ]
+        for ws in dead:
+            self.remove_ws(ws)
+
+    def lock(self, ws: WebSocket) -> asyncio.Lock:
+        if ws not in self._locks:
+            self._locks[ws] = asyncio.Lock()
+        return self._locks[ws]
+
+    def subscribe(self, channel: str, ws: WebSocket) -> None:
+        self._subscribers.setdefault(channel, set()).add(ws)
+
+    def unsubscribe(self, channel: str, ws: WebSocket) -> None:
+        if channel in self._subscribers:
+            self._subscribers[channel].discard(ws)
+
+    def remove_ws(self, ws: WebSocket) -> None:
+        for subs in self._subscribers.values():
+            subs.discard(ws)
+        self._locks.pop(ws, None)
+
+    def subscribers(self, channel: str) -> set[WebSocket]:
+        return self._subscribers.get(channel, set())
+
+
+hub = ChannelHub()
+
+
+def _origin_components(origin: str) -> tuple[str, str, int] | None:
+    """解析 Origin（scheme://host:port）为可比较的 (scheme, hostname, port)。
+
+    端口缺省按 scheme 归一（http->80、https->443）；非法/非 http(s) 返回
+    None。hostname 统一小写；IPv6 字面量（[::1]:8080）由 urlsplit 处理。
+    """
+    try:
+        parts = urlsplit(origin)
+    except ValueError:
+        return None
+    if parts.scheme not in ("http", "https") or parts.hostname is None:
+        return None
+    default_port = 443 if parts.scheme == "https" else 80
+    return (parts.scheme, parts.hostname.lower(), parts.port or default_port)
+
+
+def _origin_allowed(
+    origin: str | None, host: str | None, ws_scheme: str, cfg: WsConfig
+) -> bool:
+    """WebSocket 握手 Origin 校验：精确同源，否则查白名单。
+
+    - Origin 缺失（非浏览器客户端，如脚本/curl）放行——此类客户端不会被
+      浏览器自动携带 cookie，跨站 WebSocket 劫持面不成立
+    - 精确同源：Origin（http/https）与本次连接（ws/wss）的
+      scheme/hostname/port 逐一相等——不同端口/协议不视为同源，
+      避免同 hostname 上的其他服务借道窃取认证数据
+    - 跨源必须命中 allowed_origins（scheme://host:port 精确匹配，含端口），
+      如反代、开发服务器等场景
+    """
+    if origin is None:
+        return True
+    page = _origin_components(origin)
+    if page is None:
+        return False
+    if host is not None:
+        conn_scheme = "https" if ws_scheme == "wss" else "http"
+        conn = _origin_components(f"{conn_scheme}://{host}")
+        if conn is not None and conn == page:
+            return True
+    return any(_origin_components(entry) == page for entry in cfg.allowed_origins)
+
+
+async def _token_valid(token: str | None) -> bool:
+    """token 是否仍有效（存在且未过期）。"""
+    if token is None:
+        return False
+    token_data = await TokenManager().get_token_data(token, None)
+    return token_data is not None and token_data.expire >= datetime.now(utc)
+
+
+async def _send_json_locked(ws: WebSocket, message: dict) -> None:
+    """同一 WS 的所有发送串行化——广播/回放/meta 并发 send 会断连。"""
+    async with hub.lock(ws):
+        await ws.send_json(message)
+
+
+async def _send_to_subscriber(ws: WebSocket, message: dict) -> bool:
+    """发送失败返回 False，由调用方剔除。"""
+    try:
+        await _send_json_locked(ws, message)
+        return True
+    except Exception:
+        return False
+
+
+async def _broadcast(channel: str, data: dict) -> None:
+    """兼容旧调用点：直接转发到 :meth:`ChannelHub.broadcast`。"""
+    await hub.broadcast(channel, data)
+
+
+def _system_payload() -> dict:
+    usage = calculate_system_usage()
+    return {
+        "status": "online",
+        "cpu_usage": usage.get("cpu_usage"),
+        "memory_usage": usage.get("memory_usage"),
+        "disk_usage": usage.get("disk_usage"),
+        "network_io": usage.get("network_io"),
+        "disks": usage.get("disks"),
+        "logical_cores": usage.get("logical_cores"),
+    }
+
+
+async def _system_loop() -> None:
+    while True:
+        try:
+            await _broadcast("system", _system_payload())
+        except Exception:
+            logger.exception("system 频道推送失败")
+        cfg = await data_manager.safe_get_config()
+        await asyncio.sleep(cfg.system_interval)
+
+
+async def _bot_loop() -> None:
+    last_state: bool | None = None
+    while True:
+        try:
+            from .main import try_get_bot
+
+            connected = try_get_bot() is not None
+            if connected != last_state:
+                last_state = connected
+                await _broadcast(
+                    "bot", {"status": "online" if connected else "offline"}
+                )
+        except Exception:
+            logger.exception("bot 频道推送失败")
+        cfg = await data_manager.safe_get_config()
+        await asyncio.sleep(cfg.bot_state_interval)
+
+
+async def _log_dispatcher() -> None:
+    """事件驱动日志分发：sink 写入后按入队顺序逐条广播，不轮询文件。
+
+    _pending_logs 是待广播队列：sink（loguru 后台线程）append，
+    dispatcher（事件循环线程）popleft 逐条广播，先到先发。
+    不用「滑动窗口 + 游标」——窗口满后 len 不再增长，游标越过后
+    while 条件恒假，实时推送会永久停止。
+    完整日志持久化在 jsonl 文件（订阅回放用）。
+    loop/Event 在此补齐（sink 在模块加载时安装，彼时无事件循环）。
+    每次循环重新读取全局队列：配置热重载会整体重建队列（_rebuild_pending_logs）。
+    """
+    global _wake, _main_loop
+    _main_loop = asyncio.get_running_loop()
+    _wake = asyncio.Event()
+    while True:
+        await _wake.wait()
+        _wake.clear()
+        while True:
+            pending = _pending_logs
+            if pending is None:
+                break
+            try:
+                item = pending.popleft()
+            except IndexError:
+                break
+            await _broadcast("logs", item)
+
+
+class _LogSink:
+    """loguru sink：劫持实时日志。
+
+    每条日志同时：
+    1. 入待广播队列（dispatcher 消费后实时广播，先到先发）
+    2. 追加到 jsonl 临时文件（本次启动完整日志，一行一个 JSON：time/level/payload）
+    文件在每次 Bot 启动时删除重建（见 _init_log_file），不读不写 event.json。
+    """
+
+    def write(self, message: object) -> None:
+        record = getattr(message, "record")
+        level = record["level"].name
+        color, icon = _LEVEL_META.get(level, ("blue", "code"))
+        item = {
+            "title": level,
+            "desc": record["message"],
+            "time": record["time"].strftime("%Y-%m-%d %H:%M:%S"),
+            "icon_color": color,
+            "icon": icon,
+        }
+
+        if _pending_logs is not None:
+            _pending_logs.append(item)
+
+        _append_log_file(level, record["message"], item["time"])
+
+        if _main_loop is not None and _wake is not None:
+            _main_loop.call_soon_threadsafe(_wake.set)
+
+
+_pending_logs: deque[dict] | None = None
+_wake: asyncio.Event | None = None
+_main_loop: asyncio.AbstractEventLoop | None = None
+_sink_id: int | None = None
+
+
+
+_log_path: Path | None = None
+_file_lock = threading.Lock()
+_file_handle: TextIO | None = None
+
+
+def _init_log_file() -> None:
+    """启动初始化：删除上次启动的临时日志文件（只保留本次启动的日志）。
+
+    懒加载设计：此处不做 open，文件句柄在首次 _append_log_file 时打开。
+    """
+    global _log_path
+    log_dir = Path(get_amrita_config().log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    _log_path = log_dir / "realtime.jsonl"
+
+    _log_path.unlink(missing_ok=True)
+
+
+def _append_log_file(level: str, payload: str, time_str: str) -> None:
+    """追加一行 JSON（{time, level, payload}）。线程安全，失败仅记录 debug 日志。
+
+    懒加载：首次调用时才 open 文件句柄（append 模式）。
+    """
+    global _file_handle
+    try:
+        with _file_lock:
+            if _file_handle is None:
+                if _log_path is None:
+                    return
+                _file_handle = open(_log_path, "a", encoding="utf-8")
+            line = json.dumps(
+                {"time": time_str, "level": level, "payload": payload},
+                ensure_ascii=False,
+            )
+            _file_handle.write(line + "\n")
+            _file_handle.flush()
+    except Exception:
+
+        logger.debug("写入实时日志文件失败", exc_info=True)
+
+
+def _install_log_capture() -> None:
+    """安装 loguru sink（幂等：重复调用先移除旧 sink，防热重载重复注册）。
+
+    在模块加载时即调用：捕获本次 Bot 启动以来的全部日志（含启动早期），
+    同时初始化 jsonl 文件（启动删除旧文件）。
+    此时无需事件循环——sink 只写线程安全结构，广播由 dispatcher 补齐 loop 后驱动。
+    """
+    global _sink_id
+    if _sink_id is not None:
+        nonebot.logger.remove(_sink_id)
+    _init_log_file()
+    _sink_id = nonebot.logger.add(_LogSink(), level="INFO", enqueue=True)
+
+
+
+_install_log_capture()
+
+
+async def _bot_channel_snapshot() -> dict:
+    from .main import try_get_bot
+
+    connected = try_get_bot() is not None
+    return {"channel": "bot", "data": {"status": "online" if connected else "offline"}}
+
+
+async def _system_channel_snapshot() -> dict:
+    return {"channel": "system", "data": _system_payload()}
+
+
+
+hub.register_channel("system", _system_channel_snapshot)
+hub.register_channel("bot", _bot_channel_snapshot)
+hub.register_channel("logs")
+
+
+async def _read_log_tail(limit: int) -> list[dict[str, Any]]:
+    """从 jsonl 文件尾部读取最后 limit 条日志（tail -n limit 语义）。
+
+    按块从文件末尾向前 seek，只解析所需的尾部行——长运行的 Bot
+    日志文件可能很大，全量读取会浪费 IO 与内存。返回时间正序
+    （文件顺序）的原始记录，最多 limit 条。文件不存在时返回空列表。
+    """
+    if _log_path is None:
+        return []
+    try:
+        cfg = await data_manager.safe_get_config()
+        chunk_size = cfg.log_tail_chunk_size
+        async with aiofiles.open(_log_path, "rb") as f:
+            await f.seek(0, os.SEEK_END)
+            pos = await f.tell()
+            buf = b""
+            lines: list[str] = []
+            while pos > 0 and len(lines) < limit:
+                read_size = min(chunk_size, pos)
+                pos -= read_size
+                await f.seek(pos)
+                buf = (await f.read(read_size)) + buf
+                lines = buf.decode("utf-8", errors="ignore").splitlines()
+        items: list[dict[str, Any]] = []
+        for line in lines[-limit:]:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                items.append(json.loads(line))
+            except json.JSONDecodeError:
+
+                continue
+        return items[-limit:]
+    except Exception:
+
+        logger.debug("读取实时日志尾部失败", exc_info=True)
+        return []
+
+
+async def _flush_replay_batch(ws: WebSocket, batch: list[dict[str, Any]]) -> None:
+    """逐条发送一批回放消息（持锁，与 dispatcher 广播串行）。"""
+    for message in batch:
+        await _send_json_locked(ws, message)
+
+
+async def _send_log_replay(
+    ws: WebSocket,
+    limit: int | None = None,
+    *,
+    is_subscribed: Callable[[], bool] | None = None,
+) -> None:
+    """订阅 logs 时回放本次启动以来**最后 limit 条**日志（tail 语义）。
+
+    由调用方以后台任务方式执行（不阻塞订阅循环）；按批发送并在批间
+    让出事件循环，实时日志（dispatcher）可插队——先快速看到最近 N 条
+    历史，随后无缝跟随实时。批次大小由配置 ``log_replay_batch`` 控制
+    （asyncio.Lock 为 FIFO，dispatcher 在锁队列中优先于下一批回放获得
+    发送权）。每批前通过 ``is_subscribed`` 复检订阅状态：客户端退订 logs
+    后立即停止，不再发送历史日志。连接断开时静默结束（订阅循环的
+    finally 负责清理），失败仅留 debug 线索。
+    """
+    try:
+        cfg = await data_manager.safe_get_config()
+        if limit is None:
+            limit = cfg.log_replay_limit
+        batch: list[dict[str, Any]] = []
+        for item in await _read_log_tail(limit):
+            if is_subscribed is not None and not is_subscribed():
+                return
+            level = item.get("level", "INFO")
+            color, icon = _LEVEL_META.get(level, ("blue", "code"))
+            batch.append(
+                {
+                    "channel": "logs",
+                    "data": {
+                        "title": level,
+                        "desc": item.get("payload", ""),
+                        "time": item.get("time", ""),
+                        "icon_color": color,
+                        "icon": icon,
+                    },
+                }
+            )
+            if len(batch) >= cfg.log_replay_batch:
+                await _flush_replay_batch(ws, batch)
+                batch = []
+
+                await asyncio.sleep(0)
+        if batch:
+            await _flush_replay_batch(ws, batch)
+    except Exception:
+
+        logger.debug("日志回放中断", exc_info=True)
+
+
+_started = False
+
+_background_tasks: weakref.WeakSet[asyncio.Task] = weakref.WeakSet()
+
+
+def _spawn_background(coro: Coroutine[Any, Any, Any]) -> asyncio.Task:
+    """登记到 WeakSet：driver shutdown 统一取消，任务结束自动移除。"""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    return task
+
+
+@nonebot.get_driver().on_shutdown
+async def _cancel_background_tasks() -> None:
+    """driver shutdown 时取消，避免事件循环关闭残留 pending task。"""
+    tasks = list(_background_tasks)
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _ensure_loops() -> None:
+    global _started, _pending_logs
+    if _started:
+        return
+
+    if _pending_logs is None:
+        cfg = await data_manager.safe_get_config()
+        _pending_logs = deque(maxlen=cfg.log_pending_max)
+    _started = True
+
+    _spawn_background(_system_loop())
+    _spawn_background(_bot_loop())
+    _spawn_background(_log_dispatcher())
+
+
+def _rebuild_pending_logs(cfg: WsConfig) -> None:
+    """配置热重载后按新的 log_pending_max 重建待广播队列。
+
+    保留旧队列中尚未广播的日志（超出新上限的丢弃最旧，tail 语义）。
+    在事件循环内执行：dispatcher 每次循环重新读取全局队列，无需担心
+    引用悬挂；sink 线程在重建瞬间并发写入的少量日志仍会落 jsonl
+    文件（回放可覆盖），不丢失。
+    """
+    global _pending_logs
+    new_queue: deque[dict] = deque(maxlen=cfg.log_pending_max)
+    if _pending_logs is not None:
+        new_queue.extend(_pending_logs)
+    _pending_logs = new_queue
+
+
+async def _on_ws_config_reloaded(cfg: WsConfig) -> None:
+    """webui/config.toml 热重载钩子：按新参数重建待广播队列。"""
+    _rebuild_pending_logs(cfg)
+
+
+
+register_ws_config_reload_hook(_on_ws_config_reloaded)
+
+
+@app.websocket("/amrita/ui/ws")
+async def websocket_endpoint(ws: WebSocket) -> None:
+    """WebSocket 端点：先认证，再按订阅推送。"""
+    await ws.accept()
+
+
+    cfg = await data_manager.safe_get_config()
+    if not _origin_allowed(
+        ws.headers.get("origin"), ws.headers.get("host"), ws.url.scheme, cfg
+    ):
+        await ws.close(code=1008, reason="Origin 不被允许")
+        return
+
+
+    token = ws.cookies.get(TOKEN_KEY)
+    if not await _token_valid(token):
+        await ws.close(code=4401, reason="未授权")
+        return
+
+    await _ensure_loops()
+
+    channels: set[str] = set()
+    try:
+        while True:
+            cfg = await data_manager.safe_get_config()
+
+            timeout = cfg.auth_check_interval if cfg.auth_check_interval > 0 else None
+            try:
+                raw = await asyncio.wait_for(ws.receive_json(), timeout=timeout)
+            except asyncio.TimeoutError:
+
+                if not await _token_valid(token):
+                    await ws.close(code=4401, reason="未授权")
+                    return
+                continue
+            action = raw.get("action")
+            if action == "subscribe":
+
+                cfg = await data_manager.safe_get_config()
+                opts = raw.get("opts") or {}
+                logs_opts = opts.get("logs") or {}
+                try:
+                    logs_limit = int(logs_opts.get("limit", cfg.log_replay_limit))
+                except (TypeError, ValueError):
+                    logs_limit = cfg.log_replay_limit
+                logs_limit = min(max(logs_limit, 1), cfg.log_replay_limit_max)
+                for ch in raw.get("channels", []):
+                    if hub.has_channel(ch):
+                        if ch == "logs" and ch not in channels:
+
+                            _spawn_background(
+                                _send_log_replay(
+                                    ws,
+                                    logs_limit,
+                                    is_subscribed=lambda: "logs" in channels,
+                                )
+                            )
+                        elif ch not in channels:
+
+                            snapshot = await hub.snapshot(ch)
+                            if snapshot is not None:
+                                await _send_json_locked(ws, snapshot)
+                        hub.subscribe(ch, ws)
+                        channels.add(ch)
+                await ws.send_json(
+                    {"channel": "meta", "data": {"subscribed": sorted(channels)}}
+                )
+            elif action == "unsubscribe":
+                for ch in raw.get("channels", []):
+                    hub.unsubscribe(ch, ws)
+                    channels.discard(ch)
+                await ws.send_json(
+                    {"channel": "meta", "data": {"subscribed": sorted(channels)}}
+                )
+            elif action == "ping":
+                await ws.send_json({"channel": "meta", "data": {"pong": True}})
+    except WebSocketDisconnect:
+        pass
+    finally:
+        hub.remove_ws(ws)
+        if ws.client_state != WebSocketState.DISCONNECTED:
+            try:
+                await ws.close()
+            except Exception:
+                pass

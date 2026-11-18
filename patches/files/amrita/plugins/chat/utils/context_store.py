@@ -1,0 +1,711 @@
+"""群聊上下文静默存储 / 多模态本地存储服务层。
+
+本模块是"上下文静默存储"架构的唯一出入口，向上提供：
+
+- :func:`append_context_record` —— 把一条未被触发的群消息静默落库（替代写入记忆）
+- :func:`read_context_records` —— 供 ``read_context`` 工具按需读取
+- :func:`store_media` —— 多模态二进制落库，返回占位符所需的 ``media_id``
+- :func:`inject_image` —— 供钩子使用的图片注入 API（由本模块负责入库与落位）
+- :func:`expand_media_in_messages` / :func:`expand_media_in_content`
+  —— 读路径（**唯一**读图片二进制的入口）：占位符 -> 图片内容
+- :func:`fold_media_in_messages` —— 写路径：图片内容 -> 占位符（**纯函数，无 IO**）
+
+设计约束（重要）：**"记忆里只有占位符"必须是不变式，而不是"顺利的话"的副作用**。
+
+1. 展开只作用于副本。展开函数返回新列表，调用方把它挂到 ``model_copy()`` 上。
+   若就地改写共享的 ``CachedUserDataRepository._cached_memory``，一旦本次运行在
+   ``COMMIT_MEMORY`` 之前中断（LLM 报错 / 超时 / 取消，它是工作流最后一个节点），
+   缓存里残留的 base64 就会被后续任意"读缓存 + 写库"的命令（``/prompt set``、
+   ``/session compact`` 等）持久化进 ``memory_json``。
+2. 折叠是**纯哈希**。``media_id`` 就是二进制内容的 sha256，因此折叠只需重算哈希，
+   不需要查询 :class:`ContextMedia`（媒体随时可能被 TTL 淘汰），也不需要任何
+   进程内注册表。入库（:func:`store_media`）与折叠天然闭环。
+3. 任何绕过 ``ChatMemoryBackend.commit_memory`` 的写库路径都必须经
+   ``utils/data_access.py:update_memory``（它内部会先折叠）。
+4. 入库前的二进制一律先经 ``utils/image_norm.py`` 归一化：格式收敛到模型支持的
+   集合、尺寸收敛到配置上限。否则不被接受的格式（avif/heic/bmp）会被服务端以
+   400 拒绝，超大图则会平白推高 token 与带宽。
+
+**展开是有配额的。** 历史里的占位符每次请求都要重新展开成图片，不设上限的话图片
+会随对话轮次线性堆积。因此 :func:`expand_media_in_messages` 与
+:func:`expand_media_in_content` 必须共享同一个 :class:`MediaExpandBudget`，
+且调用方应当**先展开本轮输入**，让用户刚发的图优先占用配额。
+
+**不把结构化信息编码成文本。** 早期实现用 ``[图片已省略：<media_id> ...]`` 这样的
+标记来在非多模态运行中暂存占位符，再由正则解析还原——这要求解析器去信任一段
+用户可写的存储内容（用户照着格式发一条就能伪造标记、探测 ``media_id`` 是否存在），
+是注入面的唯一来源。现在改为在**展开时**决定能否使用图片：不支持图片就换成固定
+字面量 :data:`_NO_IMAGE_TEXT`，该分支不可逆（占位符在写回时已不存在）。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import binascii
+import hashlib
+import json
+import re
+import time
+from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import TYPE_CHECKING
+
+import aiologic
+from amrita_core.types import (
+    CONTENT_LIST_TYPE_ITEM,
+    TOOL_RESULT_CONTENT,
+    USER_INPUT,
+    Content,
+    ImageContent,
+    ImageUrl,
+    Message,
+    TextContent,
+    ToolResult,
+)
+from nonebot import logger
+from nonebot_plugin_orm import AsyncSession, get_session
+from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm.exc import StaleDataError
+
+from amrita.cache import WeakValueLRUCache
+
+from ..config import HARD_MAX_IMAGE_BYTES, config_manager
+from ..models import ContextMedia, ContextRecord, PlaceholderContent
+from .context_vars import current_uni_id
+from .image_norm import normalize_image
+
+if TYPE_CHECKING:
+    from amrita_core.hook.event import Event
+
+__all__ = [
+    "ContextEntry",
+    "MediaExpandBudget",
+    "PlaceholderContent",
+    "append_context_record",
+    "expand_media_in_content",
+    "expand_media_in_messages",
+    "fold_media_in_messages",
+    "has_placeholders",
+    "ingest_tool_media",
+    "inject_image",
+    "load_media_data_uri",
+    "placeholder_of",
+    "prune_context_store",
+    "read_context_entries",
+    "read_context_records",
+    "store_media",
+]
+
+
+_MIME_PATTERN = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}$"
+)
+
+
+_MAX_DECODED_BYTES = HARD_MAX_IMAGE_BYTES
+
+_MAX_DATA_URI_LENGTH = (_MAX_DECODED_BYTES // 3 + 1) * 4 + 64
+
+
+_last_prune_at: float = 0.0
+
+_lock_pool: WeakValueLRUCache[str, aiologic.Lock] = WeakValueLRUCache(
+    capacity=2048, loose_mode=True
+)
+
+_prune_lock: aiologic.Lock = aiologic.Lock()
+
+
+def _lock_for(key: str) -> aiologic.Lock:
+    """取（或创建）``key`` 对应的锁，用于串行化同一资源的“查-改-写”。"""
+    if (lock := _lock_pool.get(key)) is None:
+        lock = aiologic.Lock()
+        _lock_pool.put(key, lock)
+    return lock
+
+
+def _prune_interval_seconds() -> float:
+    """淘汰任务的节流间隔（秒）；配置为 0 时不节流。"""
+    return config_manager.config.context.prune_interval_minutes * 60.0
+
+
+def _sanitize_mime(mime: str) -> str:
+    """校验 MIME 格式，不合法时回落到 ``application/octet-stream``。"""
+    return mime if _MIME_PATTERN.fullmatch(mime) else "application/octet-stream"
+
+
+def _decode_data_uri(url: str) -> tuple[str, str, bytes] | None:
+    """把 ``data:<mime>;base64,<payload>`` 解析为 ``(mime, sha256, raw)``。
+
+    使用 ``partition`` 线性切分而非正则匹配，避免超长恶意负载触发回溯型 ReDoS；
+    同时在解码前先按文本长度做体积预检。
+    """
+    if len(url) > _MAX_DATA_URI_LENGTH:
+        logger.debug("data URI 长度超出上限，已忽略")
+        return None
+    prefix, sep, payload = url.partition(";base64,")
+    if not sep or not prefix.startswith("data:") or not payload:
+        return None
+    mime = prefix[len("data:") :]
+    if not _MIME_PATTERN.fullmatch(mime):
+        return None
+    try:
+        raw = base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError, TypeError):
+        return None
+    if not raw or len(raw) > _MAX_DECODED_BYTES:
+        return None
+    return mime, hashlib.sha256(raw).hexdigest(), raw
+
+
+def _iter_content_parts(message: CONTENT_LIST_TYPE_ITEM) -> list[Content] | None:
+    """取出消息中 list 形式的内容；字符串内容返回 ``None``。
+
+    Core 1.4 起 ``ToolResult.content`` 也可以是内容块列表，工具返回的图片
+    因此与用户输入走同一套折叠/展开路径。
+    """
+    if not isinstance(message, (Message, ToolResult)):
+        return None
+    content = message.content
+    return list(content) if isinstance(content, list) else None
+
+
+
+
+
+async def store_media(uni_id: str, raw: bytes, mime: str) -> str | None:
+    """把图片二进制写入本地存储。
+
+    体积闸用 ``context.max_allowed_size``（**上下文闸**，管的是最终存入上下文的图），
+    不是 ``max_image_kb``（下载闸，只管拉取）。因此这里的入参应当是**已归一化**的
+    二进制：未经归一化的原图会在这里被拒。
+
+    :return: 成功时返回 ``media_id``（sha256 hex）；体积超限或内容为空时返回 ``None``
+        （调用方应直接丢弃该图片）。
+    """
+    if not raw:
+        return None
+    limit_kb = config_manager.config.context.max_allowed_size
+    if limit_kb > 0 and len(raw) > limit_kb * 1024:
+        logger.debug(
+            f"图片体积 {len(raw) / 1024:.1f}KB 超出上下文上限 {limit_kb}KB，已丢弃"
+        )
+        return None
+
+
+    mime = _sanitize_mime(mime)
+    media_id = hashlib.sha256(raw).hexdigest()
+
+    async with _lock_for(f"media:{media_id}"):
+        async with get_session() as session:
+            exists = await session.execute(
+                select(ContextMedia).where(ContextMedia.media_id == media_id)
+            )
+            stored = exists.scalar_one_or_none()
+            if stored is None:
+                session.add(
+                    ContextMedia(
+                        media_id=media_id,
+                        uni_id=uni_id,
+                        mime=mime,
+                        size=len(raw),
+                        data=raw,
+                    )
+                )
+                try:
+                    await session.commit()
+                except IntegrityError:
+
+                    await session.rollback()
+                    logger.debug(f"媒体 {media_id[:8]} 已由其它进程写入，复用已有记录")
+            else:
+
+                stored.created_at = datetime.now()
+                try:
+                    await session.commit()
+                except StaleDataError:
+
+                    await session.rollback()
+                    session.add(
+                        ContextMedia(
+                            media_id=media_id,
+                            uni_id=uni_id,
+                            mime=mime,
+                            size=len(raw),
+                            data=raw,
+                        )
+                    )
+                    await session.commit()
+    await _maybe_prune()
+    return media_id
+
+
+async def load_media_data_uri(media_id: str) -> str | None:
+    """按 ``media_id`` 取回 ``data:<mime>;base64,<payload>``；不存在时返回 ``None``。"""
+    async with get_session() as session:
+        row = (
+            await session.execute(
+                select(ContextMedia.mime, ContextMedia.data).where(
+                    ContextMedia.media_id == media_id
+                )
+            )
+        ).one_or_none()
+    if row is None:
+        return None
+    mime, data = row
+    return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+
+
+
+
+_NO_IMAGE_TEXT = "[图片：当前模型不支持图片输入]"
+
+_MEDIA_GONE_TEXT = "[图片已过期或不可用]"
+
+_TOOL_MEDIA_REJECTED_TEXT = "[图片：工具返回的图片过大或格式不支持]"
+
+_OVER_BUDGET_TEXT = "[图片：超出本次请求的图片数量上限]"
+
+
+class MediaExpandBudget:
+    """单次请求的图片展开预算（当前轮与历史共享）。
+
+    历史里的占位符每次请求都要重新展开成图片，不设上限的话图片会随对话轮次线性
+    堆积，把 token 与带宽吃光。预算在本轮新图与历史之间共享且**本轮优先**：
+    用户刚发的图一定进得去，先被降级的是更早的历史。
+    """
+
+    __slots__ = ("_remaining",)
+
+    def __init__(self, limit: int) -> None:
+
+        self._remaining = -1 if limit <= 0 else limit
+
+    @property
+    def exhausted(self) -> bool:
+        """预算是否已耗尽（只读探测，不占用名额）。"""
+        return self._remaining == 0
+
+    def take(self) -> None:
+        """占用一个名额；调用前应确认 :attr:`exhausted` 为 ``False``。"""
+        if self._remaining > 0:
+            self._remaining -= 1
+
+
+
+_UNLIMITED_BUDGET = MediaExpandBudget(0)
+
+
+def _has_placeholder(parts: Iterable[Content]) -> bool:
+    return any(isinstance(part, PlaceholderContent) for part in parts)
+
+
+def has_placeholders(messages: Iterable[CONTENT_LIST_TYPE_ITEM]) -> bool:
+    """消息列表中是否含有待展开的占位符。"""
+    for message in messages:
+        parts = _iter_content_parts(message)
+        if parts is not None and _has_placeholder(parts):
+            return True
+    return False
+
+
+async def _expand_part(
+    part: Content, *, multimodal: bool, budget: MediaExpandBudget
+) -> Content:
+    if not isinstance(part, PlaceholderContent):
+        return part
+    if not multimodal:
+        return TextContent(text=_NO_IMAGE_TEXT)
+
+    if budget.exhausted:
+        logger.debug("本次请求的图片数量已达上限，占位符降级为说明文本")
+        return TextContent(text=_OVER_BUDGET_TEXT)
+    url = await load_media_data_uri(part.media_id)
+    if url is None:
+        logger.debug(f"上下文媒体已不可用（{part.media_id[:8]}），降级为说明文本")
+        return TextContent(text=_MEDIA_GONE_TEXT)
+
+    budget.take()
+    return ImageContent(image_url=ImageUrl(url=url))
+
+
+async def expand_media_in_messages(
+    messages: Iterable[CONTENT_LIST_TYPE_ITEM],
+    *,
+    multimodal: bool,
+    budget: MediaExpandBudget,
+) -> list[CONTENT_LIST_TYPE_ITEM]:
+    """展开记忆中的占位符，返回**新的**消息列表（不修改传入对象）。
+
+    这是本模块**唯一**读取图片二进制的入口，只在聊天触发阶段调用一次；
+    ``ChatMemoryBackend.load_memory`` 不再碰图片。
+
+    - ``multimodal=True``：占位符 -> ``data:<mime>;base64,...`` 的 ``ImageContent``；
+      二进制已被淘汰时降级为 :data:`_MEDIA_GONE_TEXT`，超出 ``budget`` 时降级为
+      :data:`_OVER_BUDGET_TEXT`。
+    - ``multimodal=False``：占位符 -> :data:`_NO_IMAGE_TEXT` 固定字面量。既不能
+      展开成 base64（纯文本模型会直接报错），也不能把 ``PlaceholderContent``
+      原样发出去（Core 会把它序列化成 ``{"type": "placeholder", ...}``，同样报错）。
+
+    非多模态分支**不可逆**：写回时占位符已不存在，该会话历史里的图片引用就此消失
+    （``ContextMedia`` 行本身仍在，直到 TTL）。这是刻意取舍，见模块 docstring。
+
+    预算按**从最近的消息往前**消耗，但输出顺序不变：历史越长，越早的图片越先被降级。
+
+    只含占位符以外的消息原样复用，不做多余拷贝。
+    """
+
+    expanded: list[CONTENT_LIST_TYPE_ITEM] = []
+    for message in reversed(list(messages)):
+        parts = _iter_content_parts(message)
+        if parts is None or not _has_placeholder(parts):
+            expanded.append(message)
+            continue
+        replaced = message.model_copy()
+        replaced.content = [
+            await _expand_part(part, multimodal=multimodal, budget=budget)
+            for part in parts
+        ]
+        expanded.append(replaced)
+    expanded.reverse()
+    return expanded
+
+
+async def expand_media_in_content(
+    content: USER_INPUT, *, multimodal: bool, budget: MediaExpandBudget
+) -> USER_INPUT:
+    """展开当前轮用户输入中的占位符（语义同 :func:`expand_media_in_messages`）。
+
+    应当在展开历史之前调用，让本轮新图优先占用 ``budget``。
+    """
+    if content is None or isinstance(content, str):
+        return content
+    if not _has_placeholder(content):
+        return content
+    return [
+        await _expand_part(part, multimodal=multimodal, budget=budget)
+        for part in content
+    ]
+
+
+
+
+
+async def ingest_tool_media(result: TOOL_RESULT_CONTENT) -> None:
+    """把工具返回的 data URI 图片归一化入库，失败时换成文本占位。"""
+    if not isinstance(result, list):
+        return
+    try:
+        cfg = config_manager.config.context
+        limit_kb, max_width, max_height = (
+            cfg.max_allowed_size,
+            cfg.max_image_width,
+            cfg.max_image_height,
+        )
+    except Exception:
+
+        limit_kb, max_width, max_height = 0, 0, 0
+    for index, part in enumerate(result):
+        if not isinstance(part, ImageContent):
+            continue
+        url = part.image_url.url
+        parsed = _decode_data_uri(url)
+        if parsed is None:
+            if url.startswith("data:"):
+                result[index] = TextContent(text=_TOOL_MEDIA_REJECTED_TEXT)
+            continue
+        _, _, raw = parsed
+        normalized = await asyncio.to_thread(
+            normalize_image,
+            raw,
+            max_width=max_width,
+            max_height=max_height,
+            max_bytes=limit_kb * 1024,
+        )
+        if not normalized.ok:
+            logger.debug(f"工具图片未通过归一化：{normalized.reason}")
+            result[index] = TextContent(text=_TOOL_MEDIA_REJECTED_TEXT)
+            continue
+        media_id = await store_media(
+            current_uni_id.get(), normalized.raw, normalized.mime
+        )
+        if media_id is None:
+            result[index] = TextContent(text=_TOOL_MEDIA_REJECTED_TEXT)
+            continue
+
+        encoded = base64.b64encode(normalized.raw).decode("ascii")
+        result[index] = ImageContent(
+            image_url=ImageUrl(url=f"data:{normalized.mime};base64,{encoded}")
+        )
+
+
+def placeholder_of(url: str) -> PlaceholderContent | None:
+    """把 ``data:<mime>;base64,<payload>`` 解析成占位符（纯函数，无 IO）。
+
+    占位符的 ``media_id`` 就是二进制内容的 sha256，因此这个转换是自洽的：
+    :func:`store_media` 用同一个哈希入库，两边天然对齐，无需查库。
+    非 data URI / MIME 非法 / base64 非法 / 体积超限都返回 ``None``。
+    """
+    parsed = _decode_data_uri(url)
+    if parsed is None:
+        return None
+    mime, media_id, raw = parsed
+    return PlaceholderContent(media_id=media_id, kind="image", mime=mime, size=len(raw))
+
+
+def fold_media_in_messages(messages: Iterable[CONTENT_LIST_TYPE_ITEM]) -> None:
+    """就地把图片内容折回占位符。
+
+    **纯函数：不读数据库、不查任何注册表。** ``media_id`` 是内容哈希，重算即可，
+    所以媒体是否已被 TTL 淘汰都不影响正确性；入库（:func:`store_media`）与折叠
+    经由同一个哈希闭环。
+
+    认不出来的内容（非 data URI / 解码失败 / 超限）原样保留，不静默丢弃。
+    同一张图只解析一次（按 url 缓存结果）。
+    """
+    messages = list(messages)
+    parsed: dict[str, PlaceholderContent] = {}
+    rejected = False
+    for message in messages:
+        for part in _iter_content_parts(message) or ():
+            url = part.image_url.url if isinstance(part, ImageContent) else None
+            if url is None or url in parsed:
+                continue
+            if (placeholder := placeholder_of(url)) is not None:
+                parsed[url] = placeholder
+            elif url.startswith("data:"):
+                rejected = True
+    if not parsed and not rejected:
+        return
+
+    for message in messages:
+        parts = _iter_content_parts(message)
+        if parts is None:
+            continue
+        replaced: list[Content] = []
+        changed = False
+        for part in parts:
+            url = part.image_url.url if isinstance(part, ImageContent) else None
+            placeholder = parsed.get(url) if url is not None else None
+            if placeholder is not None:
+                replaced.append(placeholder)
+                changed = True
+                continue
+            if url is not None and url.startswith("data:"):
+
+                replaced.append(TextContent(text=_TOOL_MEDIA_REJECTED_TEXT))
+                changed = True
+                continue
+            replaced.append(part)
+        if changed:
+            message.content = replaced
+
+
+
+
+
+async def inject_image(
+    event: Event, raw: bytes, mime: str, *, multimodal: bool
+) -> bool:
+    """供钩子使用的图片注入 API：由框架负责入库与落位。
+
+    调用方只需提供二进制与 MIME，不需要自己算哈希、建占位符或管理生命周期：
+    先经 :func:`~amrita.plugins.chat.utils.image_norm.normalize_image` 归一化（与消息
+    采集侧同一套规则：解码校验、等比缩小、转码为模型支持的格式、压缩到
+    ``max_allowed_size`` 以内），再经 :func:`store_media` 落库（体积 / 空内容由它
+    统一拒绝），最后按本次运行的多模态能力追加到 ``event.original_context.end_messages``。
+    图片属于"附加内容"，不插进历史，以免打乱已有消息顺序。
+
+    :return: 注入成功返回 ``True``；归一化或 ``store_media`` 拒绝
+        （格式不可解码 / 体积超限 / 内容为空）时返回 ``False``。
+    """
+    chat_object = getattr(event, "chat_object", None)
+    uni_id = getattr(chat_object, "session_id", "") or ""
+    context = config_manager.config.context
+    normalized = await asyncio.to_thread(
+        normalize_image,
+        raw,
+        max_width=context.max_image_width,
+        max_height=context.max_image_height,
+        max_bytes=context.max_allowed_size * 1024
+        if context.max_allowed_size > 0
+        else 0,
+    )
+    if not normalized.ok:
+        logger.debug(f"注入图片归一化失败，已忽略：{normalized.reason}")
+        return False
+    media_id = await store_media(
+        uni_id=uni_id, raw=normalized.raw, mime=normalized.mime
+    )
+    if media_id is None:
+        return False
+    placeholder = PlaceholderContent(
+        media_id=media_id,
+        kind="image",
+        mime=normalized.mime,
+        size=len(normalized.raw),
+    )
+    event.original_context.end_messages.append(
+        Message(
+            role="user",
+            content=[
+                await _expand_part(
+                    placeholder, multimodal=multimodal, budget=_UNLIMITED_BUDGET
+                )
+            ],
+        )
+    )
+    return True
+
+
+
+
+
+async def append_context_record(
+    *,
+    uni_id: str,
+    user_id: str,
+    nickname: str,
+    role: str,
+    content: str,
+    media_ids: Iterable[str] | None = None,
+) -> None:
+    """静默记录一条群聊上下文（不进入 LLM 记忆）。
+
+    ``content`` 需是已渲染好的文本（调用方用 ``utils.format.format_msg_tagged``
+    生成），本函数不再做格式处理。``media_ids`` 是该条消息附带图片的
+    ``media_id``（已由采集侧归一化并落库），按顺序存成 JSON 数组，
+    ``read_context`` 读取时按需还原。
+    """
+    if not config_manager.config.context.enable or not content.strip():
+        return
+
+    async with _lock_for(f"record:{uni_id}"):
+        async with get_session() as session:
+            session.add(
+                ContextRecord(
+                    uni_id=uni_id,
+                    user_id=user_id,
+                    nickname=nickname,
+                    role=role,
+                    content=content,
+                    media_ids=(json.dumps(list(media_ids)) if media_ids else None),
+                )
+            )
+
+            await _prune_records_for_session(
+                session, uni_id, config_manager.config.context.max_records
+            )
+            await session.commit()
+    await _maybe_prune()
+
+
+@dataclass(frozen=True)
+class ContextEntry:
+    """一条静默上下文记录：渲染好的文本 + 该条消息附带的图片 ``media_id``。"""
+
+    content: str
+    media_ids: tuple[str, ...] = ()
+
+
+def _parse_media_ids(raw: object) -> tuple[str, ...]:
+    """解析 ``ContextRecord.media_ids``；坏数据一律当作没有图片。"""
+    if not isinstance(raw, str) or not raw:
+        return ()
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return ()
+    if not isinstance(parsed, list):
+        return ()
+    return tuple(item for item in parsed if isinstance(item, str) and item)
+
+
+async def read_context_entries(
+    uni_id: str, limit: int, keyword: str | None = None
+) -> list[ContextEntry]:
+    """读取指定会话最近的上下文记录，按时间正序返回。"""
+    cfg = config_manager.config.context
+
+    limit = max(1, min(limit, cfg.read_context_limit))
+    stmt = select(ContextRecord.content, ContextRecord.media_ids).where(
+        ContextRecord.uni_id == uni_id
+    )
+    if keyword:
+        stmt = stmt.where(ContextRecord.content.contains(keyword))
+    stmt = stmt.order_by(
+        ContextRecord.created_at.desc(), ContextRecord.id.desc()
+    ).limit(limit)
+    async with get_session() as session:
+        rows = (await session.execute(stmt)).all()
+    return [
+        ContextEntry(content=content, media_ids=_parse_media_ids(media_ids))
+        for content, media_ids in reversed(rows)
+    ]
+
+
+async def read_context_records(
+    uni_id: str, limit: int, keyword: str | None = None
+) -> list[str]:
+    """读取指定会话最近的上下文记录，按时间正序返回（已渲染好的文本）。"""
+    return [
+        entry.content for entry in await read_context_entries(uni_id, limit, keyword)
+    ]
+
+
+
+
+
+async def _prune_records_for_session(
+    session: AsyncSession, uni_id: str, max_records: int
+) -> None:
+    if max_records <= 0:
+        return
+    stmt = (
+        select(ContextRecord.id)
+        .where(ContextRecord.uni_id == uni_id)
+        .order_by(ContextRecord.created_at.desc(), ContextRecord.id.desc())
+        .offset(max_records)
+    )
+    expired_ids = (await session.execute(stmt)).scalars().all()
+    if expired_ids:
+        await session.execute(
+            delete(ContextRecord).where(ContextRecord.id.in_(expired_ids))
+        )
+
+
+async def prune_context_store() -> None:
+    """按配置淘汰超期（TTL）的上下文记录与多模态二进制。"""
+    cfg = config_manager.config.context
+    now = datetime.now()
+    async with get_session() as session:
+        if cfg.record_ttl_hours > 0:
+            deadline = now - timedelta(hours=cfg.record_ttl_hours)
+            await session.execute(
+                delete(ContextRecord).where(ContextRecord.created_at < deadline)
+            )
+        if cfg.media_ttl_hours > 0:
+            deadline = now - timedelta(hours=cfg.media_ttl_hours)
+            await session.execute(
+                delete(ContextMedia).where(ContextMedia.created_at < deadline)
+            )
+        await session.commit()
+
+
+async def _maybe_prune() -> None:
+    """按 ``context.prune_interval_minutes`` 节流地触发一次淘汰。"""
+    global _last_prune_at
+    async with _prune_lock:
+        now = time.monotonic()
+        if now - _last_prune_at < _prune_interval_seconds():
+            return
+        _last_prune_at = now
+        try:
+            await prune_context_store()
+        except Exception:
+            logger.opt(exception=True).warning("上下文存储淘汰任务执行失败")

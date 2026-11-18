@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>网页搜索</title>
+<style>
+:root{color-scheme:light;--bg:#fff;--text:#18181b;--muted:#52525b;--border:#d4d4d8;--panel:#f7f7f8;--accent:#1746b2;--button:#1d4ed8;--error:#b91c1c}
+:root[data-theme=dark]{color-scheme:dark;--bg:#0b0b0d;--text:#e4e4e7;--muted:#a1a1aa;--border:#3f3f46;--panel:#141417;--accent:#adc6ff;--button:#1d4ed8;--error:#fca5a5}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.6 system-ui,"Microsoft YaHei",sans-serif}
+main{width:min(100%,760px);padding:22px 18px 32px}h1{font-size:22px;margin:0 0 14px}h2{font-size:16px;margin:0 0 8px}
+section{border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:16px}
+label{font-weight:600}label.field{display:block;margin:14px 0 4px}.hint{margin:4px 0 0;color:var(--muted)}
+.switch{display:flex;gap:8px;align-items:center;min-height:32px}.switch input{width:17px;height:17px;accent-color:var(--button)}
+input[type=password],input[type=text],select{width:100%;min-height:38px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:8px 10px;font:inherit}
+input:focus-visible,select:focus-visible,button:focus-visible,a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+button{font:inherit;min-height:38px;border:1px solid var(--border);padding:6px 13px;border-radius:6px;background:var(--panel);color:var(--text);cursor:pointer;white-space:nowrap}
+button.primary{background:var(--button);color:#fff;border-color:var(--button)}button:disabled{opacity:.55;cursor:default}
+.actions{display:flex;align-items:center;gap:12px;margin-top:12px;flex-wrap:wrap}.status{color:var(--muted);margin:0}.status.error{color:var(--error)}
+.search-row{display:flex;gap:8px}.search-row input{min-width:0;flex:1}a{color:var(--accent)}ol{padding-left:22px;margin-bottom:0}li{margin-top:10px;overflow-wrap:anywhere}li p{margin:3px 0}.source{color:var(--muted);font-size:12px}
+@media(max-width:420px){main{padding:14px 10px}section{padding:12px}.search-row{flex-wrap:wrap}.search-row input{flex-basis:100%}}
+</style>
+</head>
+<body>
+<main>
+  <h1>网页搜索</h1>
+  <section aria-labelledby="settings-title">
+    <h2 id="settings-title">搜索渠道</h2>
+    <form id="settings-form">
+      <p class="hint">两个渠道都启用时，机器人先用百度千帆，再用 Bing 兜底。设置保存后生效。</p>
+      <label class="switch"><input id="enabled" type="checkbox" disabled>启用百度千帆</label>
+      <label class="switch"><input id="bing" type="checkbox" disabled>启用 Bing</label>
+      <label class="field" for="api-key">千帆 API Key</label>
+      <input id="api-key" type="password" maxlength="256" autocomplete="off" spellcheck="false" autocapitalize="off" placeholder="粘贴千帆 API Key" aria-describedby="key-state key-hint" disabled>
+      <p id="key-state" class="hint">正在读取设置……</p>
+      <p id="key-hint" class="hint">从 <a href="https://console.bce.baidu.com/qianfan/ais/console/apiKey" target="_blank" rel="noopener noreferrer">千帆 API Key 管理</a>复制密钥。可先保存密钥并测试，再打开开关。</p>
+      <div class="actions"><button id="save" class="primary" type="submit" disabled>保存设置</button><p id="save-status" class="status" role="status"></p></div>
+    </form>
+  </section>
+  <section aria-labelledby="test-title">
+    <h2 id="test-title">测试搜索渠道</h2>
+    <p id="test-hint" class="hint">只查询选中的渠道，可以测试尚未启用的渠道。测试百度千帆会消耗一次搜索额度。</p>
+    <form id="test-form">
+      <label class="field" for="provider">搜索渠道</label>
+      <select id="provider" aria-describedby="test-hint" disabled>
+        <option value="baidu_qianfan">百度千帆</option>
+        <option value="bing">Bing</option>
+      </select>
+      <label class="field" for="query">搜索词</label>
+      <div class="search-row"><input id="query" type="text" maxlength="120" value="NoneBot2 官方文档" required aria-describedby="test-hint"><button id="test" type="submit" disabled>测试搜索</button></div>
+    </form>
+    <p id="test-status" class="status" role="status"></p>
+    <ol id="results" hidden></ol>
+  </section>
+</main>
+<script>
+const get = id => document.getElementById(id);
+const enabled = get('enabled'), key = get('api-key'), query = get('query');
+const bing = get('bing'), provider = get('provider');
+const save = get('save'), test = get('test');
+const saveStatus = get('save-status'), testStatus = get('test-status'), results = get('results');
+const settingsPath = '/api/qianwen/search/settings';
+let state = null, busy = false;
+
+function applyTheme() {
+  try {
+    const theme = localStorage.getItem('amrita-theme');
+    document.documentElement.dataset.theme = theme === 'dark' || (!theme && matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+  } catch {}
+}
+applyTheme();
+addEventListener('storage', applyTheme);
+
+function show(node, text, isError = false) {
+  node.textContent = text;
+  node.classList.toggle('error', isError);
+}
+
+function sync() {
+  const hasKey = ['saved', 'external'].includes(state?.key_state);
+  enabled.disabled = bing.disabled = key.disabled = provider.disabled = busy || !state;
+  const changed = state && (enabled.checked !== state.enabled ||
+      bing.checked !== state.bing_enabled || !!key.value.trim());
+  save.disabled = busy || !changed;
+  test.disabled = busy || !state || (provider.value === 'baidu_qianfan' && (!hasKey || !!key.value.trim()));
+}
+
+function update(data) {
+  state = data;
+  enabled.checked = data.enabled;
+  bing.checked = data.bing_enabled;
+  const descriptions = {
+    saved: '密钥已保存。留空保留原密钥，填写后会更新。',
+    external: '已从本机配置读取密钥。留空继续使用。',
+    missing: '尚未配置 API Key。',
+    unreadable: '已保存的密钥无法读取，请重新填写。'
+  };
+  get('key-state').textContent = descriptions[data.key_state];
+  sync();
+}
+
+async function request(path, method = 'GET', body) {
+  const options = {method, cache:'no-store', credentials:'same-origin'};
+  if (body) {
+    options.headers = {'Content-Type':'application/json'};
+    options.body = JSON.stringify(body);
+  }
+  let response;
+  try { response = await fetch(path, options); }
+  catch { throw new Error('无法连接面板，请刷新后重试。'); }
+  if (response.status === 401) throw new Error('登录已失效，请重新登录面板。');
+  const json = await response.json().catch(() => null);
+  if (!response.ok || !json?.success) throw new Error(json?.message || '操作失败，请稍后重试。');
+  return json;
+}
+
+for (const control of [enabled, bing, provider]) control.addEventListener('change', sync);
+key.addEventListener('input', sync);
+get('settings-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  if (!state || busy) return;
+  const apiKey = key.value.trim();
+  if (apiKey && !/^[\x21-\x7e]{1,256}$/.test(apiKey)) {
+    show(saveStatus, '密钥含有空格或换行，请只粘贴千帆 API Key。', true);
+    key.focus();
+    return;
+  }
+  if (enabled.checked && !apiKey && !['saved', 'external'].includes(state.key_state)) {
+    show(saveStatus, '启用前请先填写 API Key。', true);
+    key.focus();
+    return;
+  }
+  busy = true;
+  sync();
+  show(saveStatus, '正在保存……');
+  try {
+    const reply = await request(settingsPath, 'PUT', {
+      enabled:enabled.checked, bing_enabled:bing.checked, api_key:apiKey,
+    });
+    key.value = '';
+    update(reply.data);
+    show(saveStatus, reply.message);
+    results.replaceChildren();
+    results.hidden = true;
+    show(testStatus, '');
+  } catch (error) { show(saveStatus, error.message, true); }
+  finally { busy = false; sync(); }
+});
+
+function renderResults(items) {
+  results.replaceChildren();
+  for (const item of items) {
+    const row = document.createElement('li');
+    const link = document.createElement('a');
+    let url;
+    try { url = new URL(item.url); }
+    catch { continue; }
+    if (!['http:', 'https:'].includes(url.protocol)) continue;
+    link.href = url.href;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.textContent = item.title;
+    row.append(link);
+    const source = document.createElement('p');
+    source.className = 'source';
+    source.textContent = [item.website || url.hostname, item.date].filter(Boolean).join(' · ');
+    row.append(source);
+    if (item.snippet) {
+      const snippet = document.createElement('p');
+      snippet.textContent = item.snippet;
+      row.append(snippet);
+    }
+    results.append(row);
+  }
+  results.hidden = !results.childElementCount;
+}
+
+get('test-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  if (test.disabled) return;
+  if (!query.value.trim()) { show(testStatus, '请输入搜索词。', true); return; }
+  busy = true;
+  sync();
+  results.replaceChildren();
+  results.hidden = true;
+  show(testStatus, `正在查询 ${provider.selectedOptions[0].textContent}……`);
+  try {
+    const reply = await request('/api/qianwen/search/test', 'POST', {query:query.value.trim(), provider:provider.value});
+    renderResults(reply.data.results);
+    show(testStatus, `${reply.message} 耗时 ${reply.data.seconds} 秒。`);
+  } catch (error) { show(testStatus, error.message, true); }
+  finally { busy = false; sync(); }
+});
+
+request(settingsPath).then(reply => update(reply.data)).catch(error => {
+  get('key-state').textContent = '无法读取设置。';
+  show(saveStatus, error.message, true);
+});
+</script>
+</body>
+</html>

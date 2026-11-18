@@ -1,0 +1,11 @@
+[project]
+name = "nonebot2-qq-bot"
+version = "0.1.0"
+description = "NoneBot2 QQ bot"
+requires-python = ">=3.13,<3.14"
+
+[tool.nonebot]
+adapters = [{ name = "OneBot V11", module_name = "nonebot.adapters.onebot.v11" }]
+plugins = ["nonebot_plugin_orm", "nonebot_plugin_uniconf", "guards.whitelist", "guards.proactive", "guards.nightly_memory", "guards.trace_panel", "guards.memory_panel", "guards.silent", "guards.search_panel"]
+plugin_dirs = []
+builtin_plugins = []

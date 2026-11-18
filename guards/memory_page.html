@@ -1,0 +1,400 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>她的记忆</title>
+<style>
+:root {
+  --bg: #ffffff; --panel: #f7f7f8; --line: #e4e4e7; --text: #18181b; --muted: #71717a;
+  --accent: #2563eb; --accent-soft: #dbeafe; --ok: #16a34a; --err: #dc2626; --warn: #d97706;
+  --k-话题: #0ea5e9; --k-念头: #8b5cf6; --k-印象: #f59e0b; --k-事实: #16a34a;
+}
+:root[data-theme="dark"] {
+  --bg: #0b0b0d; --panel: #141417; --line: #27272a; --text: #e4e4e7; --muted: #a1a1aa;
+  --accent: #60a5fa; --accent-soft: #1e293b;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+  font: 14px/1.55 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
+.app { display: grid; grid-template-columns: minmax(220px, 300px) 1fr; height: 100%; }
+.side { border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
+.bar { display: flex; gap: 8px; align-items: center; padding: 10px 12px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+input[type=text], input[type=datetime-local], select, textarea {
+  padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text); font: inherit; }
+textarea { width: 100%; min-height: 64px; resize: vertical; }
+input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+button { padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--text); cursor: pointer; font: inherit; }
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.danger { color: var(--err); }
+button.danger:hover { border-color: var(--err); }
+button:disabled { opacity: .5; cursor: default; }
+.list { overflow-y: auto; flex: 1; }
+.sess { padding: 10px 12px; border-bottom: 1px solid var(--line); cursor: pointer; display: flex; align-items: center; gap: 8px; }
+.sess .info { flex: 1; min-width: 0; }
+.sess .info > div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sess .sess-del { flex: none; padding: 2px 8px; font-size: 12px; color: var(--err); background: var(--bg); }
+.sess .sess-del:hover { border-color: var(--err); }
+.sess:hover { background: var(--panel); }
+.sess.sel { background: var(--accent-soft); }
+.sess .l1 { font-weight: 600; }
+.sess .l2 { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.newsess { padding: 10px 12px; border-top: 1px solid var(--line); display: flex; gap: 6px; }
+.newsess input { flex: 1; min-width: 0; }
+.main { overflow-y: auto; min-width: 0; }
+.empty { color: var(--muted); padding: 40px; text-align: center; }
+.head { padding: 14px 18px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg); z-index: 2; }
+.head h2 { margin: 0 0 4px; font-size: 16px; font-weight: 600; }
+.tip { font-size: 12px; color: var(--muted); margin: 0; }
+.tools { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 10px; }
+.tools input[type=text] { flex: 1; min-width: 140px; }
+.chip { padding: 3px 10px; border-radius: 999px; font-size: 13px; }
+.chip.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.items { padding: 8px 18px 40px; }
+.item { border: 1px solid var(--line); border-radius: 8px; margin: 8px 0; padding: 10px 12px; }
+.item.expired { opacity: .65; }
+.item .meta { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; font-size: 12px; color: var(--muted); }
+.kind { font-size: 12px; font-weight: 600; color: #fff; border-radius: 4px; padding: 1px 8px; }
+.badge { padding: 0 6px; border-radius: 999px; font-size: 12px; border: 1px solid currentColor; }
+.badge.warn { color: var(--warn); } .badge.err { color: var(--err); }
+.item .text { margin-top: 6px; white-space: pre-wrap; word-break: break-word; }
+.item .tags { margin-top: 4px; font-size: 12px; color: var(--accent); }
+.item .acts { margin-left: auto; display: flex; gap: 6px; }
+.item .acts button { padding: 2px 8px; font-size: 12px; }
+.form { border: 1px solid var(--accent); border-radius: 8px; margin: 8px 0; padding: 12px; background: var(--panel); }
+.form .row { display: grid; grid-template-columns: 64px 1fr; gap: 8px; align-items: start; margin-bottom: 8px; }
+.form .row > label { color: var(--muted); font-size: 13px; padding-top: 6px; }
+.form .hint { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.form .btns { display: flex; gap: 8px; justify-content: flex-end; align-items: center; }
+.msg { font-size: 13px; margin-right: auto; }
+.msg.err { color: var(--err); } .msg.ok { color: var(--ok); }
+.mask { position: fixed; inset: 0; background: rgba(0, 0, 0, .45); display: none; align-items: center; justify-content: center; z-index: 10; padding: 16px; }
+.mask.show { display: flex; }
+.dialog { background: var(--bg); border: 1px solid var(--line); border-radius: 10px; width: 100%; max-width: 440px; padding: 18px; box-shadow: 0 10px 40px rgba(0, 0, 0, .3); }
+.dialog h3 { margin: 0 0 8px; font-size: 16px; }
+.dialog p { margin: 6px 0; }
+.dialog ul { margin: 6px 0; padding-left: 20px; color: var(--muted); font-size: 13px; }
+.dialog .btns { display: flex; gap: 8px; justify-content: flex-end; align-items: center; margin-top: 14px; }
+button.danger-solid { background: var(--err); border-color: var(--err); color: #fff; }
+@media (max-width: 760px) {
+  .app { grid-template-columns: 1fr; grid-template-rows: 34% 66%; }
+  .side { border-right: 0; border-bottom: 1px solid var(--line); }
+  .form .row { grid-template-columns: 1fr; }
+  .form .row > label { padding-top: 0; }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="side">
+    <div class="bar"><b>会话</b><button id="reload" style="margin-left:auto">刷新</button></div>
+    <div class="list" id="sessions"><div class="empty">读取中…</div></div>
+    <div class="newsess">
+      <input type="text" id="newkey" placeholder="g 加群号，或 u 加 QQ 号">
+      <button id="open">打开</button>
+    </div>
+  </aside>
+  <main class="main" id="main"><div class="empty">左边选一个会话查看她记住的东西</div></main>
+</div>
+<div class="mask" id="mask">
+  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dlg-title">
+    <h3 id="dlg-title"></h3>
+    <div id="dlg-body"></div>
+    <div class="btns"><span class="msg err" id="dlg-msg"></span><button id="dlg-cancel">取消</button><button class="danger-solid" id="dlg-ok">确认删除</button></div>
+  </div>
+</div>
+<script>
+(function () {
+  // 跟随面板的明暗主题
+  try {
+    var t = localStorage.getItem("amrita-theme") || (parent && parent.localStorage.getItem("amrita-theme"));
+    var dark = t === "dark" || (t !== "light" && matchMedia("(prefers-color-scheme: dark)").matches);
+    if (dark) document.documentElement.dataset.theme = "dark";
+  } catch (e) {}
+
+  var sessEl = document.getElementById("sessions"), mainEl = document.getElementById("main"), newKeyEl = document.getElementById("newkey");
+  var KINDS = ["话题", "念头", "印象", "事实"], ttlHours = {"话题": 48, "念头": 168};
+  var sessions = [], current = "", items = [], filterKind = "", query = "", editing = null, confirming = null, notice = null, exists = false;
+
+  function esc(s) { return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) { return {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]; }); }
+  function sessName(key) { return (key.charAt(0) === "g" ? "群 " : "私聊 ") + key.slice(1); }
+  function ago(ts) {
+    var d = new Date(ts * 1000);
+    return (d.getMonth() + 1) + "/" + d.getDate() + " " + d.toLocaleTimeString("zh-CN", {hour12: false, hour: "2-digit", minute: "2-digit"});
+  }
+  function ttlText(kind) {
+    var h = ttlHours[kind];
+    if (!h) return "不会过期";
+    return h % 24 === 0 && h > 48 ? (h / 24) + " 天后过期" : h + " 小时后过期";
+  }
+  function left(item) {
+    if (item.expires_at == null) return "";
+    var sec = item.expires_at - Date.now() / 1000;
+    if (sec <= 0) return "";
+    return sec >= 86400 ? "还剩 " + Math.floor(sec / 86400) + " 天" : sec >= 3600 ? "还剩 " + Math.floor(sec / 3600) + " 小时" : "还剩不到 1 小时";
+  }
+  function nowLocal() {
+    var d = new Date(), p = function (n) { return String(n).padStart(2, "0"); };
+    return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + "T" + p(d.getHours()) + ":" + p(d.getMinutes());
+  }
+
+  async function api(url, body) {
+    var opt = {credentials: "same-origin", cache: "no-store"};
+    if (body) { opt.method = "POST"; opt.headers = {"Content-Type": "application/json"}; opt.body = JSON.stringify(body); }
+    var r = await fetch(url, opt);
+    if (r.status === 401) throw new Error("登录已过期，请刷新面板重新登录");
+    var j = await r.json().catch(function () { return {}; });
+    if (!j.success) throw new Error(j.message || "请求失败（" + r.status + "）");
+    return j.data;
+  }
+
+  function renderSessions() {
+    var list = sessions.slice();
+    if (current && !list.some(function (s) { return s.key === current; })) list.unshift({key: current, count: 0, expired: 0, fresh: true});
+    if (!list.length) { sessEl.innerHTML = '<div class="empty">她还没有记住任何东西。<br>在下面输入会话可以替她写第一条</div>'; return; }
+    sessEl.innerHTML = list.map(function (s) {
+      var l2 = s.fresh ? "还没有记忆" : s.count + " 条" + (s.expired ? "，其中 " + s.expired + " 条已过期" : "") + " · " + ago(s.updated);
+      return '<div class="sess' + (s.key === current ? " sel" : "") + '" data-key="' + esc(s.key) + '"><div class="info"><div class="l1">' + esc(sessName(s.key)) +
+        '</div><div class="l2">' + esc(l2) + "</div></div>" +
+        (s.fresh ? "" : '<button class="sess-del" title="删除这个会话的全部记忆">删除</button>') + "</div>";
+    }).join("");
+  }
+
+  function formHtml(item) {
+    var isNew = !item;
+    var kind = item ? item.kind : (filterKind || "事实");
+    if (KINDS.indexOf(kind) < 0) kind = "事实";
+    var when = item && item.time ? (item.time.length === 10 ? item.time + "T00:00" : item.time.replace(" ", "T")) : nowLocal();
+    return '<div class="form" id="form"><div class="row"><label>分类</label><div><select id="f-kind">' +
+      KINDS.map(function (k) { return "<option" + (k === kind ? " selected" : "") + ">" + k + "</option>"; }).join("") +
+      '</select><div class="hint" id="f-kind-hint"></div></div></div>' +
+      '<div class="row"><label>内容</label><div><textarea id="f-text" maxlength="500" placeholder="一句话写清楚要她记住什么">' + esc(item ? item.text : "") +
+      '</textarea><div class="hint">换行会合并成一行；一条最多 500 字</div></div></div>' +
+      '<div class="row"><label>对象/主题</label><div><input type="text" id="f-subject" maxlength="80" style="width:100%" placeholder="印象填群友标识，话题填固定主题" value="' + esc(item ? item.subject : "") + '"><div class="hint">同对象印象会合并，同主题话题会更新</div></div></div>' +
+      '<div id="f-topic-fields"><div class="row"><label>参与者</label><div><input type="text" id="f-participants" style="width:100%" placeholder="用逗号隔开，最多 10 位" value="' + esc(item ? item.participants.join(",") : "") + '"></div></div>' +
+      '<div class="row"><label>待追问</label><div><input type="text" id="f-question" maxlength="200" style="width:100%" placeholder="下次想继续问什么；解决后清空" value="' + esc(item ? item.pending_question : "") + '"></div></div></div>' +
+      '<div class="row"><label>标签</label><div><input type="text" id="f-tags" style="width:100%" placeholder="人名或主题，用逗号隔开，可不填" value="' +
+      esc(item ? item.tags.join(",") : "") + '"></div></div>' +
+      '<div class="row"><label>时间</label><div><input type="datetime-local" id="f-time" value="' + esc(when) +
+      '"><div class="hint">话题和念头从这个时间起算保鲜期</div></div></div>' +
+      '<div class="btns"><span class="msg err" id="f-msg"></span><button id="f-cancel">取消</button>' +
+      '<button class="primary" id="f-save">' + (isNew ? "写入" : "保存修改") + "</button></div></div>";
+  }
+
+  function detailHtml(it) {
+    var parts = [];
+    if (it.subject) parts.push("对象/主题：" + it.subject);
+    if (it.participants && it.participants.length) parts.push("参与者：" + it.participants.join("、"));
+    if (it.pending_question) parts.push("待追问：" + it.pending_question);
+    return parts.length ? '<div class="tip" style="margin-top:6px;white-space:pre-wrap;word-break:break-word">' + parts.map(esc).join("<br>") + "</div>" : "";
+  }
+
+  function itemHtml(it) {
+    if (editing === it.raw) return formHtml(it);
+    var badges = "";
+    if (it.expired) badges += '<span class="badge warn" title="过期的话题和念头不会再给她看，她下次写记忆时会顺手清掉">已过期</span>';
+    else if (left(it)) badges += "<span>" + esc(left(it)) + "</span>";
+    if (!it.parsed) badges += '<span class="badge err" title="这一行不是标准写法，会原样作为事实给她看；改一次保存就会变成标准写法">格式不标准</span>';
+    var acts = '<button data-act="edit">修改</button><button class="danger" data-act="del">删除</button>';
+    return '<div class="item' + (it.expired ? " expired" : "") + '" data-index="' + it.index + '"><div class="meta">' +
+      '<span class="kind" style="background:var(--k-' + esc(it.kind) + ', var(--muted))">' + esc(it.kind) + "</span>" +
+      (it.time ? "<span>" + esc(it.time) + "</span>" : "") + badges + (it.id ? "<span>#" + esc(it.id) + "</span>" : "") +
+      '<span class="acts">' + acts + "</span></div>" +
+      '<div class="text">' + esc(it.text) + "</div>" + detailHtml(it) +
+      (it.tags.length ? '<div class="tags">' + it.tags.map(function (t) { return "#" + esc(t); }).join(" ") + "</div>" : "") + "</div>";
+  }
+
+  function itemsHtml() {
+    var q = query.trim().toLowerCase();
+    var shown = items.filter(function (it) {
+      return (!filterKind || it.kind === filterKind) && (!q || it.raw.toLowerCase().indexOf(q) >= 0);
+    }).reverse();
+    var h = editing === "__new__" ? formHtml(null) : "";
+    if (!shown.length) h += '<div class="empty">' + (items.length ? "没有符合条件的记忆" : "这个会话还没有记忆，点「写入一条」替她记下第一条") + "</div>";
+    else h += shown.map(itemHtml).join("");
+    return h;
+  }
+
+  function renderMain() {
+    if (!current) { mainEl.innerHTML = '<div class="empty">左边选一个会话查看她记住的东西</div>'; return; }
+    var counts = {};
+    items.forEach(function (it) { counts[it.kind] = (counts[it.kind] || 0) + 1; });
+    var h ='<div class="head"><h2>' + esc(sessName(current)) + " 的记忆</h2>" +
+      '<p class="tip">共 ' + items.length + " 条。每次叫醒她时，各类最多取最近 10 条，总计最多 1500 字写进提示词；话题 48 小时、念头 7 天后过期，印象和事实不过期。改动立刻生效。</p>" +
+      '<div class="tools"><button class="chip' + (filterKind ? "" : " on") + '" data-kind="">全部 ' + items.length + "</button>" +
+      KINDS.map(function (k) { return '<button class="chip' + (filterKind === k ? " on" : "") + '" data-kind="' + k + '">' + k + " " + (counts[k] || 0) + "</button>"; }).join("") +
+      '<input type="text" id="search" placeholder="搜内容、标签或 id" value="' + esc(query) + '">' +
+      '<button class="primary" id="add">写入一条</button></div>' +
+      (notice ? '<p class="msg ' + notice.cls + '" style="margin:8px 0 0">' + esc(notice.text) + "</p>" : "") + "</div>" +
+      '<div class="items" id="items">' + itemsHtml() + "</div>";
+    mainEl.innerHTML = h;
+    var kindSel = document.getElementById("f-kind");
+    if (kindSel) {
+      var hint = function () { document.getElementById("f-kind-hint").textContent = {"话题": "正在进行的事", "念头": "待办或想问的", "印象": "对某个人的判断", "事实": "确定的信息"}[kindSel.value] + "，" + ttlText(kindSel.value); };
+      var updateKind = function () {
+        hint();
+        document.getElementById("f-topic-fields").hidden = kindSel.value !== "话题" && kindSel.value !== "念头";
+      };
+      kindSel.onchange = updateKind; updateKind();
+      document.getElementById("f-text").focus();
+    }
+  }
+
+  async function loadSessions() {
+    var data = await api("/api/qianwen/memory/sessions");
+    sessions = data.sessions;
+    if (data.kinds && data.kinds.length) KINDS = data.kinds;
+    if (data.ttl_hours) ttlHours = data.ttl_hours;
+    renderSessions();
+  }
+
+  async function loadItems() {
+    if (!current) return;
+    var data = await api("/api/qianwen/memory/items?session=" + encodeURIComponent(current));
+    items = data.items; exists = !!data.exists;
+    renderMain();
+  }
+
+  var maskEl = document.getElementById("mask"), dlgMsg = document.getElementById("dlg-msg"), dlgOk = document.getElementById("dlg-ok");
+  var clearing = null;
+
+  function closeDialog() { maskEl.classList.remove("show"); clearing = null; }
+
+  async function askClear(key, btn) {
+    //  点的不是当前打开的会话时，先把它的记忆读出来，弹窗里的条数才对得上
+    var list = items;
+    if (key !== current) {
+      if (btn) btn.disabled = true;
+      try { list = (await api("/api/qianwen/memory/items?session=" + encodeURIComponent(key))).items; }
+      catch (e) { if (btn) btn.disabled = false; if (current) fail(e); else alert(e.message); return; }
+      if (btn) btn.disabled = false;
+    }
+    var counts = {}, expired = 0;
+    list.forEach(function (it) { counts[it.kind] = (counts[it.kind] || 0) + 1; if (it.expired) expired++; });
+    var parts = KINDS.filter(function (k) { return counts[k]; }).map(function (k) { return k + " " + counts[k] + " 条"; });
+    Object.keys(counts).forEach(function (k) { if (KINDS.indexOf(k) < 0) parts.push(k + " " + counts[k] + " 条"); });
+    clearing = {url: "/api/qianwen/memory/clear", body: {session: key, expect: list.length}};
+    document.getElementById("dlg-title").textContent = "删除「" + sessName(key) + "」的全部记忆？";
+    document.getElementById("dlg-body").innerHTML =
+      "<p>将删除这个会话的 <b>" + list.length + "</b> 条记忆" + (parts.length ? "（" + esc(parts.join("、")) + "）" : "") + "。</p><ul>" +
+      "<li>删除后她在这个会话里不再记得这些内容，立刻生效</li>" +
+      (expired ? "<li>其中 " + expired + " 条已过期，本来也不会再给她看</li>" : "") +
+      "<li>其他会话的记忆不受影响</li>" + "</ul>" +
+      '<p class="msg err">记忆文件会被直接删除，删除后无法找回。</p>';
+    dlgMsg.textContent = ""; dlgOk.disabled = false;
+    maskEl.classList.add("show");
+    document.getElementById("dlg-cancel").focus();
+  }
+
+  function askDelete(item) {
+    clearing = {url: "/api/qianwen/memory/delete", body: {session: current, raw: item.raw, index: item.index}, single: true};
+    document.getElementById("dlg-title").textContent = "删除这条记忆？";
+    document.getElementById("dlg-body").innerHTML =
+      '<p><span class="kind" style="background:var(--k-' + esc(item.kind) + ', var(--muted))">' + esc(item.kind) + "</span> " +
+      '<span class="tip">' + esc(sessName(current)) + (item.time ? " · " + esc(item.time) : "") + (item.id ? " · #" + esc(item.id) : "") + "</span></p>" +
+      '<p style="white-space:pre-wrap;word-break:break-word;max-height:160px;overflow:auto">' + esc(item.text) + "</p>" +
+      (item.tags.length ? '<p class="tip">' + item.tags.map(function (t) { return "#" + esc(t); }).join(" ") + "</p>" : "") +
+      detailHtml(item) + '<p class="msg err">这条记忆会被直接删除，删除后无法找回。</p>';
+    dlgMsg.textContent = ""; dlgOk.disabled = false;
+    maskEl.classList.add("show");
+    document.getElementById("dlg-cancel").focus();
+  }
+
+  async function doClear() {
+    if (!clearing) return;
+    var job = clearing;
+    dlgOk.disabled = true; dlgMsg.textContent = "";
+    try {
+      var data = await api(job.url, job.body);
+      closeDialog();
+      if (job.single || job.body.session === current) editing = null;
+      notice = {cls: "ok", text: job.single ? "已删除这条记忆" : "已删除「" + sessName(job.body.session) + "」的全部 " + data.removed + " 条记忆"};
+      loadSessions().catch(function () {});
+      if (current) await loadItems();
+    } catch (e) { dlgOk.disabled = false; dlgMsg.textContent = e.message; }
+  }
+
+  document.getElementById("dlg-cancel").onclick = closeDialog;
+  dlgOk.onclick = doClear;
+  maskEl.addEventListener("click", function (e) { if (e.target === maskEl) closeDialog(); });
+  document.addEventListener("keydown", function (e) { if (e.key === "Escape" && clearing) closeDialog(); });
+
+  function fail(e) { notice = {cls: "err", text: e.message}; renderMain(); }
+
+  async function select(key) {
+    current = key; editing = null; confirming = null; notice = null; filterKind = ""; query = ""; items = []; exists = false;
+    renderSessions();
+    mainEl.innerHTML = '<div class="empty">读取中…</div>';
+    try { await loadItems(); } catch (e) { mainEl.innerHTML = '<div class="empty">' + esc(e.message) + "</div>"; }
+  }
+
+  sessEl.addEventListener("click", function (e) {
+    var del = e.target.closest(".sess-del");
+    if (del) { askClear(del.closest(".sess").dataset.key, del); return; }
+    var el = e.target.closest(".sess");
+    if (el) select(el.dataset.key);
+  });
+
+  function openTyped() {
+    var key = newKeyEl.value.trim().toLowerCase().replace(/\s+/g, "");
+    if (/^\d{3,12}$/.test(key)) { newKeyEl.value = ""; newKeyEl.placeholder = "前面要加 g（群）或 u（私聊），如 g" + key; return; }
+    if (!/^[gu]\d{3,12}$/.test(key)) { newKeyEl.value = ""; newKeyEl.placeholder = "写法：g 加群号，或 u 加 QQ 号"; return; }
+    newKeyEl.value = "";
+    select(key);
+  }
+  document.getElementById("open").onclick = openTyped;
+  newKeyEl.addEventListener("keydown", function (e) { if (e.key === "Enter") openTyped(); });
+  document.getElementById("reload").onclick = function () {
+    loadSessions().catch(function (e) { sessEl.innerHTML = '<div class="empty">' + esc(e.message) + "</div>"; });
+    if (current) { editing = null; confirming = null; notice = null; loadItems().catch(fail); }
+  };
+
+  async function save() {
+    var item = editing === "__new__" ? null : items.filter(function (it) { return it.raw === editing; })[0];
+    var msg = document.getElementById("f-msg"), btn = document.getElementById("f-save");
+    var body = {
+      session: current, kind: document.getElementById("f-kind").value, text: document.getElementById("f-text").value,
+      tags: document.getElementById("f-tags").value, time: document.getElementById("f-time").value,
+      subject: document.getElementById("f-subject").value,
+      participants: document.getElementById("f-participants").value.split(/[,，、]+/).map(function (p) { return p.trim(); }).filter(Boolean),
+      pending_question: document.getElementById("f-question").value,
+    };
+    if (!body.text.trim()) { msg.textContent = "内容不能为空"; return; }
+    if (item) { body.raw = item.raw; body.index = item.index; }
+    btn.disabled = true; msg.textContent = "";
+    try {
+      var saved = await api("/api/qianwen/memory/save", body);
+      editing = null; notice = {cls: "ok", text: item ? "已保存修改" : "已" + (saved.action || "写入")};
+      await loadItems(); loadSessions().catch(function () {});
+    } catch (e) { btn.disabled = false; msg.textContent = e.message; }
+  }
+
+  mainEl.addEventListener("click", function (e) {
+    var chip = e.target.closest(".chip");
+    if (chip) { filterKind = chip.dataset.kind; notice = null; renderMain(); return; }
+    if (e.target.id === "add") { editing = "__new__"; confirming = null; notice = null; renderMain(); return; }
+    if (e.target.id === "f-cancel") { editing = null; renderMain(); return; }
+    if (e.target.id === "f-save") { save(); return; }
+    var act = e.target.dataset && e.target.dataset.act, row = e.target.closest(".item");
+    if (!act || !row) return;
+    var item = items.filter(function (it) { return String(it.index) === row.dataset.index; })[0];
+    if (!item) return;
+    notice = null;
+    if (act === "edit") { editing = item.raw; confirming = null; renderMain(); }
+    else if (act === "del") askDelete(item);
+  });
+
+  mainEl.addEventListener("input", function (e) {
+    if (e.target.id !== "search") return;
+    //  只重画列表、不动搜索框本身，不然中文输入法打到一半会被打断
+    query = e.target.value; editing = null; confirming = null;
+    document.getElementById("items").innerHTML = itemsHtml();
+  });
+
+  loadSessions().then(function () { if (sessions.length) select(sessions[0].key); })
+    .catch(function (e) { sessEl.innerHTML = '<div class="empty">' + esc(e.message) + "</div>"; });
+})();
+</script>
+</body>
+</html>

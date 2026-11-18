@@ -1,0 +1,156 @@
+enable = true
+parse_segments = true
+preset = "default"
+group_prompt_character = "default"
+private_prompt_character = "default"
+
+[core.function_config]
+use_minimal_context = false
+agent_tool_call_limit = 10
+agent_tool_parallel_limit = 0
+agent_tool_refusal_rounds = 2
+validate_tool_arguments = true
+agent_step_token_budget = -1
+agent_middle_message = true
+agent_mcp_client_enable = true
+agent_mcp_server_scripts = []
+
+[core.llm]
+require_tools = false
+max_tokens = 10000
+compaction_max_tokens = 2048
+session_tokens_windows = 65536
+llm_timeout = 60
+max_retries = 3
+max_fallbacks = 5
+context_strategy = "compact"
+compaction_trigger_ratio = 0.9
+slide_target_ratio = 0.7
+memory_length_limit = 20
+enable_overflow_recovery = true
+enable_multi_modal = true
+
+[core.cookie]
+enable_cookie = false
+cookie = ""
+
+[core.builtin]
+tool_calling_mode = "agent"
+agent_thought_mode = "chat"
+loop_reasoning_trigger = 5
+
+[core.builtin.react_config]
+structured_reasoning = false
+reasoning_depth = 3
+enable_reflection = false
+reflection_depth = 1
+reasoning_aware_tools = false
+tool_prediction = false
+
+[preset_extension]
+backup_preset_list = []
+
+[session]
+session_control = false
+session_allow_continue = true
+session_control_time = 60
+session_control_history = 10
+session_long_running_notify_seconds = 180
+
+[skills]
+enable = true
+mode = "progressive"
+selected = []
+echo_skill_directory = true
+allow_script_execution = false
+
+[meta]
+enable = true
+reflection = true
+error_report = true
+stream_reasoning = false
+reasoning = true
+tool_call = false
+skill_trigger = true
+
+[meta.step]
+decompose = true
+intro = true
+leave = true
+stall = true
+compress = true
+
+[autoreply]
+enable = true
+global_enable = true
+probability = 0.05
+keywords = []
+keywords_mode = "contains"
+
+[function]
+message_type = "legacy"
+chat_pending_mode = "interactive"
+chat_debounce_window = 1.5
+chat_debounce_max_messages = 20
+chat_debounce_max_wait = 5.0
+synthesize_forward_message = true
+nature_chat_style = true
+nature_chat_cut_pattern = "([。！？!?;；\\n]+)[\"\"\\'\\'\"\\s]*"
+poke_reply = true
+enable_group_chat = true
+enable_private_chat = true
+allow_custom_prompt = true
+use_user_nickname = false
+forward_threshold = 200
+forward_min_chunk = 500
+
+[extended]
+say_after_self_msg_be_deleted = false
+group_added_msg = ""
+send_msg_after_be_invited = false
+after_deleted_say_what = []
+
+[llm]
+block_msg = [
+    "警告，该会话已被熔断",
+]
+agent_strategy = "react"
+agent_workflow = "react"
+
+[llm.tools]
+enable_report = true
+report_exclude_system_prompt = true
+report_exclude_context = false
+report_then_block = true
+report_invoke_level = "medium"
+
+[context]
+enable = true
+max_records = 200
+record_ttl_hours = 72
+read_context_limit = 20
+read_context_max_images = 4
+read_context_images = true
+max_image_kb = 10240
+max_allowed_size = 2048
+max_image_width = 2048
+max_image_height = 2048
+max_images_per_message = 4
+max_images_per_request = 8
+media_ttl_hours = 24
+prune_interval_minutes = 10
+local_media_dirs = []
+
+[extra]
+
+[usage_limit]
+enable_usage_limit = false
+group_daily_limit = 100
+user_daily_limit = 100
+group_daily_token_limit = 200000
+user_daily_token_limit = 100000
+total_daily_limit = 1500
+total_daily_token_limit = 1000000
+limit_msg = [
+    "今日额度已达上限，请明天再试。",
+]
