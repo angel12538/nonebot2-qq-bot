@@ -42,6 +42,7 @@
 | 面板入口 | 用途 |
 | --- | --- |
 | 配置管理 → qianwen | 管理白名单、管理员、聊天节奏、表情和图片限制、晚间提炼、追踪和出站设置。 |
+| 聊天管理 → 提示词预设 | 分别新建或编辑群聊和私聊的人设模板。 |
 | 聊天管理 → 网页搜索 | 设置百度千帆 Key，独立启停和测试两个搜索渠道。也可直接访问 `/qianwen-search`。 |
 | 聊天管理 → 她的记忆 | 按会话和分类查看、搜索、新增、编辑或清理记忆。也可直接访问 `/qianwen-memory`。 |
 | 系统信息 → 对话追踪 | 查看触发原因、模型请求、工具调用、发送结果、报错和分步耗时。需先启用追踪，生成配置默认关闭。 |
@@ -70,6 +71,36 @@ py -3.13 -m venv .venv
 ```
 
 已有部署更新时，将仓库更新到最新提交后重启机器人，即可加载 `guards/nightly_memory.py` 中的晚间提炼修复。
+
+## 修改人设提示词
+
+登录 WebUI，进入「聊天管理 → 提示词预设」，选择群聊或私聊，编辑当前使用的模板并保存。两种场景默认都选中 `default`，可以分别设置角色身份、语气、称呼和回复示例。
+
+也可以直接用文本编辑器修改文件。下列路径均相对于项目根目录，提示词以 UTF-8 编码保存。
+
+| 场景 | 默认文件 | `config/chat/config.toml` 中的模板选项 |
+| --- | --- | --- |
+| 群聊 | `config/chat/group_prompts/default.txt` | `group_prompt_character` |
+| 私聊 | `config/chat/private_prompts/default.txt` | `private_prompt_character` |
+
+首次启动时，机器人会在空的提示词目录中创建 `default.txt`。修改当前模板后，等日志出现「提示词文件已重载」，后续对话就会使用新内容。需要切换模板时，在对应目录新建 `角色名.txt`，把上表对应的配置项改为文件名去掉 `.txt` 后的部分，然后重启机器人。
+
+例如，群聊使用 `config/chat/group_prompts/friendly.txt`，私聊继续用默认模板，可将 `config/chat/config.toml` 的顶层选项设置如下。
+
+```toml
+group_prompt_character = "friendly"
+private_prompt_character = "default"
+```
+
+模板中可使用 `{self_id}`、`{user_id}`、`{user_name}`，机器人会在聊天时填入自己的 QQ 号、当前发言人的 QQ 号和昵称。篇幅较长的示例可以放在带 `〔完整〕` 标记的一级或二级标题下，由 `config/qianwen/config.toml` 中的 `persona.full_every_n` 控制完整人设的发送频率。
+
+需要拆分规则时，可在项目根目录下创建 `persona/` 并按需添加以下 UTF-8 文件。规则加载由 `config/qianwen/config.toml` 中的 `persona.rules_enabled` 控制，默认开启。保存后，下一次构建提示词时会读取新内容。
+
+| 文件 | 用途 |
+| --- | --- |
+| `persona/rules.md` | 聊天行为规则，例如如何接话、何时保持静默。 |
+| `persona/tools.md` | 工具判断规则，例如使用条件、参数和操作限制。 |
+| `persona/safety.md` | 聊天与工具判断共用的安全边界。 |
 
 ## 项目文件
 
