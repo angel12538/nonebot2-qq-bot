@@ -180,30 +180,85 @@ def payload(day: str, session: str, source: list[dict], existing: list[dict], cf
     return {"date": day, "session": session, "max_items": cfg["max_items"], "existing_memories": existing, "new_messages": source}
 
 
-async def extract(data: dict) -> str:
+# 提炼请求的可靠性参数：网关偶尔一分多钟不吐字节，一次抖动不该毁掉整晚。
+TIMEOUT = 180.0
+ATTEMPTS = 3
+BACKOFF = (10.0, 30.0)
 
+
+def error_text(exc: BaseException) -> str:
+    """沿异常链取最里层的原始错误。
+
+    amrita 的预设回退钩子在 backup_preset_list 为空时会用 FallbackFailed 盖掉真实原因，
+    参数还是元组，日志里就成了 ``FallbackFailed(('No more preset available!',))``。
+    """
+    seen: set[int] = set()
+    cur = exc
+    while True:
+        nxt = cur.__cause__ or cur.__context__
+        if nxt is None or id(nxt) in seen or len(seen) >= 8:
+            break
+        seen.add(id(nxt))
+        cur = nxt
+    args = getattr(cur, "args", ())
+    message = args[0] if len(args) == 1 else " / ".join(str(a) for a in args)
+    if isinstance(message, (tuple, list)):
+        message = " / ".join(str(x) for x in message)
+    return f"{type(cur).__name__}: {message}".strip() or type(cur).__name__
+
+
+async def request(messages, preset, config) -> str:
     from amrita_core import call_completion
-    from amrita_core.types import Message, UniResponse
-    from amrita.plugins.chat.config import config_manager
-    from amrita.plugins.chat.utils.preset import resolve_preset
+    from amrita_core.types import UniResponse
 
-    preset = (await resolve_preset(fix=False)).model_copy(deep=True)
-    preset.config.stream = False
-    preset.config.temperature = 0.2
-    preset.max_output = 4096
-    config = config_manager.config.core.model_copy(deep=True)
-    config.llm.max_retries = 0
-    config.llm.max_fallbacks = 1
-    config.llm.llm_timeout = 90
-    messages = [Message(role="system", content=PROMPT), Message(role="user", content=json.dumps(data, ensure_ascii=False))]
-    chunks, final = [], ""
-    async with asyncio.timeout(100):
+    chunks: list[str] = []
+    final = ""
+    # 外层比 llm_timeout 多留 20 秒，让适配器自己的超时先抛出（带原始错误信息）
+    async with asyncio.timeout(TIMEOUT + 20):
         async for part in call_completion(messages, preset=preset, config=config):
             if isinstance(part, str):
                 chunks.append(part)
             elif isinstance(part, UniResponse) and isinstance(part.content, str):
                 final = part.content
-    return final or "".join(chunks)
+    joined = "".join(chunks)
+    # 正常情况两者一致；取长的那个，万一适配器只把最后一段塞进尾包也不会丢内容
+    return final if len(final) >= len(joined) else joined
+
+
+async def extract(data: dict) -> str:
+    from amrita_core.types import Message
+    from amrita.plugins.chat.config import config_manager
+    from amrita.plugins.chat.utils.preset import resolve_preset
+
+    preset = (await resolve_preset(fix=False)).model_copy(deep=True)
+    # 非流式要等整段输出生成完才有第一个字节，长输入很容易撞上读超时；流式每个分片都会刷新读超时
+    preset.config.stream = True
+    preset.config.temperature = 0.2
+    preset.max_output = 4096
+    config = config_manager.config.core.model_copy(deep=True)
+    config.llm.max_retries = 0
+    # 只有一个预设且 backup_preset_list 为空，回退链一触发就会抛 FallbackFailed 并盖掉真实错误，
+    # 失败交给下面的重试处理
+    config.llm.max_fallbacks = 1
+    config.llm.llm_timeout = TIMEOUT
+    messages = [Message(role="system", content=PROMPT), Message(role="user", content=json.dumps(data, ensure_ascii=False))]
+    error: Exception | None = None
+    for attempt in range(1, ATTEMPTS + 1):
+        try:
+            text = await request(messages, preset.model_copy(deep=True), config.model_copy(deep=True))
+        except Exception as exc:  # noqa: BLE001
+            error = exc
+        else:
+            if text.strip():
+                return text
+            error = ValueError("模型返回空内容")
+        if attempt < ATTEMPTS:
+            wait = BACKOFF[min(attempt - 1, len(BACKOFF) - 1)]
+            logger.warning(f"[自动记忆] 第 {attempt} 次提炼请求失败（{error_text(error)}），{wait:.0f} 秒后重试")
+            await asyncio.sleep(wait)
+    if error is None:
+        raise RuntimeError("提炼请求未产生结果")
+    raise error
 
 
 def parse_output(text: str, data: dict) -> list[dict]:
@@ -287,9 +342,10 @@ async def run_session(day: str, session: str, start: float, end: float, cfg: dic
         raise
     except Exception as exc:
         error = exc
-        trace.step("记忆", "自动提炼失败", {"错误类型": type(exc).__name__, "说明": str(exc)[:200]})
-        await asyncio.to_thread(finish, day, session, "失败", {"错误类型": type(exc).__name__, "说明": str(exc)[:200]})
-        logger.warning(f"[自动记忆] {day} {session} 提炼失败：{type(exc).__name__}；当晚不重复请求")
+        reason = error_text(exc)
+        trace.step("记忆", "自动提炼失败", {"错误类型": type(exc).__name__, "原因": reason[:300]})
+        await asyncio.to_thread(finish, day, session, "失败", {"错误类型": type(exc).__name__, "原因": reason[:300]})
+        logger.warning(f"[自动记忆] {day} {session} 提炼失败：{reason[:300]}；当晚不重复请求")
     finally:
         trace.end(error)
 
