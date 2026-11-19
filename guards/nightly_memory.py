@@ -182,7 +182,8 @@ def payload(day: str, session: str, source: list[dict], existing: list[dict], cf
 
 async def extract(data: dict) -> str:
 
-    from amrita_core import Message, UniResponse, call_completion
+    from amrita_core import call_completion
+    from amrita_core.types import Message, UniResponse
     from amrita.plugins.chat.config import config_manager
     from amrita.plugins.chat.utils.preset import resolve_preset
 
