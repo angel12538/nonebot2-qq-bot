@@ -301,6 +301,8 @@ async def entry(event: MessageEvent, matcher: Matcher, bot: Bot):
         event=event,
         session_id=session_id,
     ):
+        if _trace:
+            _trace.skip()
         return
 
     try:

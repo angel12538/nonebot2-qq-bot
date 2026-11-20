@@ -216,13 +216,13 @@ def mark(kind: str, title: str, since: float | None = None, data: Any = None) ->
     step(kind, title, data, started=since or now, duration_ms=int((now - since) * 1000) if since else None)
 
 
-def end(error: BaseException | None = None) -> None:
+def end(error: BaseException | None = None, status: str | None = None) -> None:
     try:
         turn = _cur.get()
         if not turn:
             return
         now = time.time()
-        status = "出错" if error is not None else "完成"
+        status = status or ("出错" if error is not None else "完成")
         reply = " / ".join(turn["reply"])[:300]
         if error is not None:
             step("结束", f"出错：{type(error).__name__}", {"错误": repr(error)}, started=now, duration_ms=0, turn=turn)
@@ -242,6 +242,21 @@ def end(error: BaseException | None = None) -> None:
         pass
 
 
+def skip(note: str = "消息并入进行中的对话，本轮不单独回复") -> None:
+    """本轮没走到正常收尾就返回了，补一次收尾。
+
+    interactive 模式（chat_pending_mode）在抢到会话锁之前就把消息并给正在跑的那一轮，
+    然后直接 return，绕过了 entry() 的 trace.end，面板上就一直挂着「进行中」。
+    """
+    try:
+        turn = _cur.get()
+        if not turn:
+            return
+        turn["reply"].append(note)
+        step("结束", "并入进行中的对话", {"说明": note}, duration_ms=0)
+        end(status="已合并")
+    except Exception:
+        pass
 
 
 def llm_start(kind: str, preset: Any, messages: Any, tools: Any = None) -> dict | None:
