@@ -27,7 +27,7 @@ flowchart LR
 """
 
 from dataclasses import dataclass
-from time import time
+from time import localtime, strftime, time
 from typing import Literal
 
 from amrita_sense import Node
@@ -243,8 +243,11 @@ class ContextCompactor:
         self,
         prefix: CONTENT_LIST_TYPE,
         previous: str = "",
+        window_start: float | None = None,
     ) -> str:
         """Summarize ``prefix``, merging it into ``previous`` when given.
+
+        ``window_start`` 给定时，摘要只保留这一天之后的内容（历史摘要只留近 7 天）。
 
         Returns the stripped summary, or an empty string when the model
         produced nothing usable. Callers decide what an empty result means.
@@ -253,12 +256,20 @@ class ContextCompactor:
         body = "".join(f"{it}\n" for it in text_generator(history, split_role=True))
         if previous:
             body = f"【已有摘要】\n{previous}\n【已有摘要结束】\n\n{body}"
+        hint = ""
+        if window_start is not None:
+            hint = (
+                f"这是滚动历史摘要：只保留 {strftime('%Y-%m-%d', localtime(window_start))}"
+                " 之后（含当天）的信息，更早的内容一律丢弃，不要写进摘要；"
+                "输出一份覆盖这段时间的综合摘要，每条带日期。\n\n"
+            )
         prompt: CONTENT_LIST_TYPE = [
             Message[str](role="system", content=self.instruction),
             Message[str](
                 role="user",
                 content=(
-                    "Make a summary of full informations in message list:"
+                    hint
+                    + "Make a summary of full informations in message list:"
                     "\n\n```text\n" + body + "\n```"
                 ),
             ),
@@ -302,26 +313,33 @@ class ContextCompactor:
     async def fold_summary(
         self, messages: CONTENT_LIST_TYPE, parts: list[SummaryPart],
     ) -> tuple[CONTENT_LIST_TYPE, list[SummaryPart]] | None:
-        """仅合并同一天的摘要，保留最早来源时间，避免合并时续期。"""
+        """把窗口内的素材压成一份「最近 7 天综合摘要」。
+
+        原实现按天各存一条片段，一条跨天建出来的旧摘要（例如「11-11 至 11-18」）只要
+        创建时间还在 7 天内，文本里更早的内容就会一直留在提示词里。这里改成：窗口内的
+        旧片段先拼成一份「已有摘要」，和窗口内的新素材一起重写成一条摘要，
+        时间戳取本次压缩时间——7 天内每次压缩都会重写，停止压缩 7 天后整条作废。
+        """
         prefix, tail = split_history(messages)
         if not prefix:
             return None
         cutoff = time() - SUMMARY_RETENTION
-        summaries = {
-            _summary_day(part.source_at): part for part in parts if part.source_at >= cutoff
-        }
-        for day, (source_at, source) in _dated_prefix(prefix, cutoff).items():
-            previous = summaries.get(day)
-            summary = await self.summarize(source, previous.text if previous else "")
-            if not summary:
-                logger.warning("历史摘要返回为空，保留本轮压缩前的对话")
-                return None
-            earliest = min(source_at, previous.source_at) if previous else source_at
-            summaries[day] = SummaryPart(source_at=earliest, text=summary)
-        cutoff = time() - SUMMARY_RETENTION
-        return tail, [
-            part for _, part in sorted(summaries.items()) if part.source_at >= cutoff
-        ]
+        kept = sorted(
+            (part for part in parts if part.source_at >= cutoff),
+            key=lambda part: part.source_at,
+        )
+        groups = _dated_prefix(prefix, cutoff)
+        merged: CONTENT_LIST_TYPE = []
+        for day in sorted(groups):
+            merged.extend(groups[day][1])
+        if not merged:
+            return tail, kept
+        previous = "\n\n".join(part.text for part in kept)
+        summary = await self.summarize(merged, previous, window_start=cutoff)
+        if not summary:
+            logger.warning("历史摘要返回为空，保留本轮压缩前的对话")
+            return None
+        return tail, [SummaryPart(source_at=time(), text=summary)]
 
     async def compact(self, memory: MemoryModel) -> bool:
         """Fold ``memory`` in place, storing the summary on ``abstract``.
